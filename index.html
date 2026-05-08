@@ -148,17 +148,22 @@
         </header>
         <div class="path-dialog-body">
           <div class="path-current">
-            <div class="path-current-main">
+            <label class="path-current-main" for="pathDialogInput">
               <span class="path-current-label">当前路径</span>
+              <input class="path-current-input" id="pathDialogInput" type="text" autocomplete="off" spellcheck="false" />
               <span class="path-current-value" id="pathDialogCurrent"></span>
+            </label>
+            <div class="path-current-actions">
+              <button class="secondary-action" id="openPathInput" type="button">打开</button>
+              <button class="secondary-action" id="chooseCurrentPath" type="button">选择此路径</button>
             </div>
-            <button class="secondary-action" id="chooseCurrentPath" type="button">选择此路径</button>
           </div>
           <div class="path-nav">
             <button class="path-nav-button" id="pathBack" type="button">后退</button>
             <button class="path-nav-button" id="pathForward" type="button">前进</button>
             <button class="path-nav-button" id="pathParent" type="button">上一级</button>
           </div>
+          <div class="path-history-list" id="pathHistoryList"></div>
           <div class="path-directory-list" id="pathDirectoryList"></div>
           <span class="path-dialog-status" id="pathDialogStatus" aria-live="polite"></span>
         </div>

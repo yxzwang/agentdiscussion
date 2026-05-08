@@ -23,6 +23,7 @@ http://localhost:5173
 - 每个路径下会保存有用户消息的讨论组历史和 agent session 状态；空历史不会写入路径缓存。
 - 左侧讨论组支持关闭和恢复：关闭只隐藏当前打开项，不删除路径缓存；恢复会弹出该路径下所有可恢复讨论组供选择。
 - agent 调用由后端后台任务执行；关闭前端页面不会中断正在运行的 Codex / Claude Code，重新打开后会继续显示处理中状态或最终回复。
+- 如果 Web 服务本身重启或关闭导致后台任务丢失，重新读取状态时会把对应“正在处理”消息标记为已中断，避免无限显示处理中。
 - Codex / Claude Code agent 可以在左侧列表里直接改名，新的名称会成为 `@` 点名名称。
 - agent 进入讨论组后默认静默。
 - 用户消息里只有明确 `@AgentName` 的 agent 会回复。
@@ -49,6 +50,10 @@ http://localhost:5173
 - `AGENTDISCUSSION_SCHEDULE_FILE`：定时任务状态文件，默认 `.mca/schedules.json`
 
 本地需要先完成 Codex CLI 和 Claude Code CLI 的登录或 API key 配置。
+Codex 后端调用不再指定 `--sandbox`，使用当前 Codex CLI 的默认沙箱策略。
+如果 Web 服务当前以 root/sudo 环境运行，后端会自动使用 Claude Code 的 `acceptEdits` 权限模式，避免触发 Claude Code 对 `bypassPermissions` 的安全拒绝；非 root 启动时仍会启用 `bypassPermissions`。
+`acceptEdits` 模式下后端默认额外允许 Claude Code 执行 `Bash(mkdir:*)`、`Bash(python3:*)` 和 `Bash(python:*)`，用于定时任务抓取数据和落盘文件；需要调整时可设置 `CLAUDE_ALLOWED_TOOLS`，用逗号分隔工具规则。
+如果确认要开启 Claude Code 的危险免确认模式，需要用普通用户启动 Web 服务并设置 `CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=1`。Claude Code 会拒绝 root/sudo 进程使用该模式；后端会自动传入最近的 `.claude/settings.json`，也可以用 `CLAUDE_SETTINGS_FILE=/path/to/settings.json` 指定。
 
 ## 讨论组路径
 新建讨论组和修改已有讨论组路径时，路径输入框旁都有“选择”按钮。点击后会打开路径选择窗口，可以从当前路径进入子目录、返回上一级，并用后退/前进在已浏览路径间切换；选择后仍会走后端目录校验。

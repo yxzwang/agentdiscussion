@@ -9,7 +9,7 @@ const agentTypes = {
   },
 };
 
-const API_BASE = window.location.protocol === "file:" ? "http://localhost:5173" : "";
+const API_BASE = window.location.protocol === "file:" ? "http://localhost:5173" : getAppBasePath();
 const FALLBACK_AGENT_TIMEOUT_MS = 300000;
 const CLIENT_TIMEOUT_PADDING_MS = 5000;
 const MIN_CLIENT_TIMEOUT_MS = 10000;
@@ -20,6 +20,27 @@ const AUTO_SCROLL_THRESHOLD_PX = 48;
 const SCHEDULE_REFRESH_MS = 5000;
 const SCHEDULE_DRAFT_KEY = "agentdiscussion.scheduleDraft";
 const PATH_DIALOG_DRAFT_KEY = "agentdiscussion.pathDialogDraft";
+
+function getAppBasePath() {
+  const scriptSrc = document.currentScript?.src || "";
+  if (scriptSrc) {
+    try {
+      const scriptBase = new URL(".", scriptSrc);
+      const scriptPath = scriptBase.pathname.replace(/\/$/, "");
+      return scriptPath === "/" ? "" : scriptPath;
+    } catch {
+      // Fall back to the page path below.
+    }
+  }
+
+  const pathname = window.location.pathname || "/";
+  if (pathname === "/") return "";
+
+  const basePath = pathname.endsWith("/")
+    ? pathname.slice(0, -1)
+    : pathname.replace(/\/[^/]*$/, "");
+  return basePath === "/" ? "" : basePath;
+}
 
 const state = {
   rooms: [],
@@ -45,6 +66,7 @@ const state = {
     directories: [],
     history: [],
     historyIndex: -1,
+    tree: createEmptyPathTree(),
   },
 };
 
@@ -75,12 +97,15 @@ const elements = {
   closeCacheDialog: document.querySelector("#closeCacheDialog"),
   pathDialog: document.querySelector("#pathDialog"),
   pathDialogTitle: document.querySelector("#pathDialogTitle"),
+  pathDialogInput: document.querySelector("#pathDialogInput"),
   pathDialogCurrent: document.querySelector("#pathDialogCurrent"),
+  pathHistoryList: document.querySelector("#pathHistoryList"),
   pathDirectoryList: document.querySelector("#pathDirectoryList"),
   pathDialogStatus: document.querySelector("#pathDialogStatus"),
   pathBack: document.querySelector("#pathBack"),
   pathForward: document.querySelector("#pathForward"),
   pathParent: document.querySelector("#pathParent"),
+  openPathInput: document.querySelector("#openPathInput"),
   chooseCurrentPath: document.querySelector("#chooseCurrentPath"),
   closePathDialog: document.querySelector("#closePathDialog"),
   mentionStrip: document.querySelector("#mentionStrip"),
@@ -293,10 +318,14 @@ async function openPathDialog(target) {
     directories: [],
     history: Array.isArray(draft.history) ? draft.history : [],
     historyIndex: Number.isInteger(draft.historyIndex) ? draft.historyIndex : -1,
+    tree: createEmptyPathTree(),
   };
   elements.pathDialogTitle.textContent = target === "new-room" ? "选择新讨论组路径" : "选择讨论组路径";
   elements.pathDialog.hidden = false;
-  await loadPathDialog(seedPath, { pushHistory: true });
+  await loadPathDialog(seedPath, {
+    pushHistory: true,
+    fallbackPath: state.defaultWorkingDir || "",
+  });
 }
 
 function closePathDialog() {
@@ -309,6 +338,7 @@ function closePathDialog() {
     directories: [],
     history: [],
     historyIndex: -1,
+    tree: createEmptyPathTree(),
   };
   setPathDialogStatus("");
 }
@@ -532,12 +562,16 @@ async function saveSchedule() {
 }
 
 async function loadPathDialog(pathText, options = {}) {
+  const requestedPath = normalizePathText(pathText || state.defaultWorkingDir);
+  if (requestedPath) elements.pathDialogInput.value = requestedPath;
+
   try {
     setPathDialogStatus("读取中");
-    const payload = await browsePath(pathText || state.defaultWorkingDir);
+    const payload = await browsePath(requestedPath);
     state.pathDialog.currentPath = payload.workingDir;
     state.pathDialog.parentPath = payload.parent || null;
     state.pathDialog.directories = Array.isArray(payload.directories) ? payload.directories : [];
+    await syncPathTree(payload.workingDir, state.pathDialog.directories);
 
     if (Number.isInteger(options.historyIndex)) {
       state.pathDialog.historyIndex = options.historyIndex;
@@ -554,8 +588,31 @@ async function loadPathDialog(pathText, options = {}) {
     persistPathDialogDraft();
     setPathDialogStatus("");
   } catch (error) {
+    const hasFallbackPath = Object.prototype.hasOwnProperty.call(options, "fallbackPath");
+    const fallbackPath = String(options.fallbackPath || "");
+    if (hasFallbackPath && fallbackPath !== requestedPath) {
+      try {
+        const nextOptions = { ...options };
+        delete nextOptions.fallbackPath;
+        await loadPathDialog(fallbackPath, nextOptions);
+        setPathDialogStatus("原路径不可用，已打开默认路径", true);
+        return;
+      } catch {
+        // Show the original path error below; it is more useful to the user.
+      }
+    }
     setPathDialogStatus(error.message || "读取路径失败", true);
   }
+}
+
+async function openTypedPath() {
+  const pathText = normalizePathText(elements.pathDialogInput.value);
+  if (!pathText) {
+    setPathDialogStatus("请输入路径", true);
+    return;
+  }
+
+  await loadPathDialog(pathText, { pushHistory: true });
 }
 
 async function openPathParent() {
@@ -567,6 +624,188 @@ async function movePathHistory(delta) {
   const nextIndex = state.pathDialog.historyIndex + delta;
   if (nextIndex < 0 || nextIndex >= state.pathDialog.history.length) return;
   await loadPathDialog(state.pathDialog.history[nextIndex], { historyIndex: nextIndex });
+}
+
+async function openPathHistoryItem(indexText) {
+  const index = Number(indexText);
+  if (!Number.isInteger(index) || index < 0 || index >= state.pathDialog.history.length) return;
+  await loadPathDialog(state.pathDialog.history[index], { historyIndex: index });
+}
+
+async function togglePathTreeNode(pathText) {
+  const node = getPathTreeNode(pathText);
+  if (!node) return;
+
+  if (node.expanded) {
+    node.expanded = false;
+    renderPathDialog();
+    persistPathDialogDraft();
+    return;
+  }
+
+  node.expanded = true;
+  if (!node.loaded) {
+    try {
+      const payload = await browsePath(node.path);
+      setPathTreeNodeDirectories(payload.workingDir, payload.directories);
+    } catch (error) {
+      node.error = error.message || "路径不可读";
+    }
+  }
+
+  renderPathDialog();
+  persistPathDialogDraft();
+}
+
+async function syncPathTree(currentPath, directories) {
+  const currentTreePath = normalizeTreePath(currentPath);
+  const ancestors = getPathAncestors(currentTreePath);
+  if (ancestors.length === 0) return;
+
+  const rootPath = ancestors[0];
+  if (!state.pathDialog.tree.roots.includes(rootPath)) {
+    state.pathDialog.tree.roots = [rootPath];
+  }
+
+  for (const ancestor of ancestors) {
+    const node = getOrCreatePathTreeNode(ancestor);
+    node.expanded = true;
+
+    if (normalizeTreePath(ancestor) === currentTreePath) {
+      setPathTreeNodeDirectories(currentTreePath, directories);
+    } else if (!node.loaded) {
+      try {
+        const payload = await browsePath(ancestor);
+        setPathTreeNodeDirectories(payload.workingDir, payload.directories);
+      } catch (error) {
+        node.error = error.message || "路径不可读";
+      }
+    }
+  }
+}
+
+function createEmptyPathTree() {
+  return {
+    roots: [],
+    nodes: {},
+  };
+}
+
+function getPathTreeNode(pathText) {
+  const treePath = normalizeTreePath(pathText);
+  return state.pathDialog.tree.nodes[treePath] || null;
+}
+
+function getOrCreatePathTreeNode(pathText, fallbackName = "") {
+  const treePath = normalizeTreePath(pathText);
+  if (!state.pathDialog.tree.nodes[treePath]) {
+    state.pathDialog.tree.nodes[treePath] = {
+      path: treePath,
+      name: fallbackName || getPathBaseName(treePath),
+      directories: [],
+      loaded: false,
+      expanded: false,
+      error: "",
+    };
+  } else if (fallbackName) {
+    state.pathDialog.tree.nodes[treePath].name = fallbackName;
+  }
+
+  return state.pathDialog.tree.nodes[treePath];
+}
+
+function setPathTreeNodeDirectories(pathText, directories) {
+  const node = getOrCreatePathTreeNode(pathText);
+  node.directories = Array.isArray(directories)
+    ? directories.map((directory) => ({
+        name: String(directory.name || getPathBaseName(directory.path)),
+        path: normalizeTreePath(directory.path),
+      }))
+    : [];
+  node.loaded = true;
+  node.error = "";
+
+  node.directories.forEach((directory) => {
+    getOrCreatePathTreeNode(directory.path, directory.name);
+  });
+}
+
+function getPathAncestors(pathText) {
+  const treePath = normalizeTreePath(pathText);
+  if (!treePath) return [];
+
+  const driveMatch = treePath.match(/^[a-zA-Z]:\\/);
+  if (driveMatch) {
+    const root = driveMatch[0];
+    const parts = treePath.slice(root.length).split(/[\\/]+/).filter(Boolean);
+    const ancestors = [root];
+    let current = root;
+    parts.forEach((part) => {
+      current = current.endsWith("\\") ? `${current}${part}` : `${current}\\${part}`;
+      ancestors.push(current);
+    });
+    return ancestors;
+  }
+
+  if (treePath.startsWith("\\\\")) {
+    const parts = treePath.split("\\").filter(Boolean);
+    if (parts.length < 2) return [treePath];
+    const root = `\\\\${parts[0]}\\${parts[1]}`;
+    const ancestors = [root];
+    let current = root;
+    parts.slice(2).forEach((part) => {
+      current = `${current}\\${part}`;
+      ancestors.push(current);
+    });
+    return ancestors;
+  }
+
+  if (treePath.startsWith("/")) {
+    const parts = treePath.split("/").filter(Boolean);
+    const ancestors = ["/"];
+    let current = "/";
+    parts.forEach((part) => {
+      current = current === "/" ? `/${part}` : `${current}/${part}`;
+      ancestors.push(current);
+    });
+    return ancestors;
+  }
+
+  const parts = treePath.split(/[\\/]+/).filter(Boolean);
+  const ancestors = [];
+  let current = "";
+  parts.forEach((part) => {
+    current = current ? `${current}/${part}` : part;
+    ancestors.push(current);
+  });
+  return ancestors;
+}
+
+function normalizeTreePath(value) {
+  let text = normalizePathText(value);
+  if (!text) return "";
+
+  const driveMatch = text.match(/^([a-zA-Z]:)[\\/]*$/);
+  if (driveMatch) return `${driveMatch[1].toUpperCase()}\\`;
+  if (/^[a-zA-Z]:[\\/]/.test(text)) {
+    text = text.replace(/\//g, "\\").replace(/\\+$/g, "");
+    return text.charAt(0).toUpperCase() + text.slice(1);
+  }
+  if (text.startsWith("\\\\")) return text.replace(/\\+$/g, "");
+  if (text === "/") return "/";
+  return text.replace(/\/+$/g, "");
+}
+
+function getPathBaseName(pathText) {
+  const treePath = normalizeTreePath(pathText);
+  if (treePath === "/") return "/";
+  if (/^[a-zA-Z]:\\$/.test(treePath)) return treePath;
+  if (treePath.startsWith("\\\\")) {
+    const parts = treePath.split("\\").filter(Boolean);
+    return parts[parts.length - 1] || treePath;
+  }
+  const parts = treePath.split(/[\\/]+/).filter(Boolean);
+  return parts[parts.length - 1] || treePath;
 }
 
 function chooseCurrentPath() {
@@ -1002,7 +1241,7 @@ async function resolveWorkingDir(pathText) {
 
 async function browsePath(pathText) {
   const params = new URLSearchParams({
-    path: pathText || state.defaultWorkingDir,
+    path: normalizePathText(pathText || state.defaultWorkingDir),
   });
   const response = await fetch(`${API_BASE}/api/paths/browse?${params.toString()}`, {
     cache: "no-store",
@@ -1042,6 +1281,18 @@ async function listCachedRooms(pathText) {
   }
 
   return Array.isArray(payload.rooms) ? payload.rooms : [];
+}
+
+function normalizePathText(value) {
+  let text = String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  if (
+    (text.startsWith("\"") && text.endsWith("\"")) ||
+    (text.startsWith("'") && text.endsWith("'")) ||
+    (text.startsWith("`") && text.endsWith("`"))
+  ) {
+    text = text.slice(1, -1).trim();
+  }
+  return text;
 }
 
 async function loadSchedules() {
@@ -1599,31 +1850,66 @@ function renderCacheDialog(sourceRoom) {
 
 function renderPathDialog() {
   elements.pathDialogCurrent.textContent = state.pathDialog.currentPath || "未选择";
+  if (state.pathDialog.currentPath) elements.pathDialogInput.value = state.pathDialog.currentPath;
   elements.pathBack.disabled = state.pathDialog.historyIndex <= 0;
   elements.pathForward.disabled =
     state.pathDialog.historyIndex < 0 ||
     state.pathDialog.historyIndex >= state.pathDialog.history.length - 1;
   elements.pathParent.disabled = !state.pathDialog.parentPath;
   elements.chooseCurrentPath.disabled = !state.pathDialog.currentPath;
+  elements.openPathInput.disabled = !normalizePathText(elements.pathDialogInput.value);
+  elements.pathHistoryList.innerHTML = state.pathDialog.history.length
+    ? state.pathDialog.history
+        .map((historyPath, index) => {
+          const active = index === state.pathDialog.historyIndex ? " active" : "";
+          return `<button class="path-history-item${active}" type="button" data-action="open-history-path" data-history-index="${index}" title="${escapeHtml(historyPath)}">${escapeHtml(historyPath)}</button>`;
+        })
+        .join("")
+    : `<span class="path-dialog-status">暂无历史路径</span>`;
 
-  if (state.pathDialog.directories.length === 0) {
-    elements.pathDirectoryList.innerHTML = `<div class="empty-state compact">没有可进入的子目录</div>`;
-    return;
+  const roots = state.pathDialog.tree.roots.length
+    ? state.pathDialog.tree.roots
+    : getPathAncestors(state.pathDialog.currentPath).slice(0, 1);
+  elements.pathDirectoryList.innerHTML = roots.length
+    ? roots.map((rootPath) => renderPathTreeNode(rootPath, 0)).join("")
+    : `<div class="empty-state compact">没有可进入的目录</div>`;
+}
+
+function renderPathTreeNode(pathText, depth) {
+  const node = getOrCreatePathTreeNode(pathText);
+  const isCurrent = normalizeTreePath(node.path) === normalizeTreePath(state.pathDialog.currentPath);
+  const activeClass = isCurrent ? " active" : "";
+  const expandedClass = node.expanded ? " expanded" : "";
+  const hasKnownChildren = node.directories.length > 0;
+  const canToggle = !node.loaded || hasKnownChildren || Boolean(node.error);
+  const toggleText = node.expanded ? "▾" : "▸";
+  const toggleButton = canToggle
+    ? `<button class="path-tree-toggle" type="button" data-action="toggle-tree-path" data-path="${escapeHtml(node.path)}" aria-label="${node.expanded ? "收起" : "展开"} ${escapeHtml(node.name)}">${toggleText}</button>`
+    : `<span class="path-tree-toggle placeholder"></span>`;
+  const row = `
+    <div class="path-tree-row${activeClass}${expandedClass}" style="--depth: ${depth}">
+      ${toggleButton}
+      <button class="path-tree-name" type="button" data-action="open-tree-path" data-path="${escapeHtml(node.path)}" title="${escapeHtml(node.path)}">
+        <span class="path-tree-label">${escapeHtml(node.name)}</span>
+        <span class="path-tree-full">${escapeHtml(node.path)}</span>
+      </button>
+    </div>
+  `;
+
+  if (!node.expanded) return row;
+  if (node.error) {
+    return `${row}<div class="path-tree-error" style="--depth: ${depth + 1}">${escapeHtml(node.error)}</div>`;
+  }
+  if (!node.loaded) {
+    return `${row}<div class="path-tree-loading" style="--depth: ${depth + 1}">读取中</div>`;
+  }
+  if (node.directories.length === 0) {
+    return `${row}<div class="path-tree-empty" style="--depth: ${depth + 1}">没有子目录</div>`;
   }
 
-  elements.pathDirectoryList.innerHTML = state.pathDialog.directories
-    .map(
-      (directory) => `
-        <button class="path-directory-item" type="button" data-action="open-path" data-path="${escapeHtml(directory.path)}">
-          <span class="path-directory-main">
-            <span class="path-directory-name">${escapeHtml(directory.name)}</span>
-            <span class="path-directory-path">${escapeHtml(directory.path)}</span>
-          </span>
-          <span class="path-directory-arrow">›</span>
-        </button>
-      `,
-    )
-    .join("");
+  return `${row}${node.directories
+    .map((directory) => renderPathTreeNode(directory.path, depth + 1))
+    .join("")}`;
 }
 
 function renderRoomSettings(room) {
@@ -1880,6 +2166,16 @@ elements.selectRoomPath.addEventListener("click", () => openPathDialog("room-set
 elements.pathBack.addEventListener("click", () => movePathHistory(-1));
 elements.pathForward.addEventListener("click", () => movePathHistory(1));
 elements.pathParent.addEventListener("click", openPathParent);
+elements.openPathInput.addEventListener("click", openTypedPath);
+elements.pathDialogInput.addEventListener("input", () => {
+  elements.openPathInput.disabled = !normalizePathText(elements.pathDialogInput.value);
+});
+elements.pathDialogInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    openTypedPath();
+  }
+});
 elements.chooseCurrentPath.addEventListener("click", chooseCurrentPath);
 elements.sendMessage.addEventListener("click", sendMessage);
 elements.messageInput.addEventListener("input", updateSendState);
@@ -1907,6 +2203,18 @@ document.addEventListener("click", (event) => {
   }
 
   if (target.dataset.action === "open-path") {
+    loadPathDialog(target.dataset.path, { pushHistory: true });
+  }
+
+  if (target.dataset.action === "open-history-path") {
+    openPathHistoryItem(target.dataset.historyIndex);
+  }
+
+  if (target.dataset.action === "toggle-tree-path") {
+    togglePathTreeNode(target.dataset.path);
+  }
+
+  if (target.dataset.action === "open-tree-path") {
     loadPathDialog(target.dataset.path, { pushHistory: true });
   }
 

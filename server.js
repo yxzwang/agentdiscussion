@@ -12,10 +12,12 @@ const DEFAULT_AGENT_TIMEOUT_MS = 300000;
 const AGENT_TIMEOUT_MS = readPositiveIntegerEnv("AGENT_TIMEOUT_MS", DEFAULT_AGENT_TIMEOUT_MS);
 const AGENT_KILL_GRACE_MS = 3000;
 const AGENT_RESTART_RETRY_LIMIT = 1;
+const STALE_UNREGISTERED_TYPING_MS = 30000;
 const APP_DATA_DIR = path.join(ROOT, ".mca");
 const OPEN_STATE_FILE = process.env.AGENTDISCUSSION_STATE_FILE || path.join(APP_DATA_DIR, "open-rooms.json");
 const SCHEDULE_STATE_FILE =
   process.env.AGENTDISCUSSION_SCHEDULE_FILE || path.join(APP_DATA_DIR, "schedules.json");
+const DEFAULT_CLAUDE_ALLOWED_TOOLS = ["Bash(mkdir:*)", "Bash(python3:*)", "Bash(python:*)"];
 const PATH_CACHE_DIR = ".agentdiscussion-cache";
 const PATH_CACHE_FILE = "rooms.json";
 const BACKGROUND_JOBS = new Map();
@@ -71,14 +73,12 @@ const AGENTS = {
         workingDir,
         args: [
           "--ask-for-approval",
-          "never",
-          "exec",
-          "--skip-git-repo-check",
-          "--sandbox",
-          "read-only",
-          "--cd",
-          workingDir,
-          "--color",
+            "never",
+            "exec",
+            "--skip-git-repo-check",
+            "--cd",
+            workingDir,
+            "--color",
           "never",
           "--output-last-message",
           outputFile,
@@ -106,17 +106,37 @@ const AGENTS = {
     command: process.env.CLAUDE_COMMAND || commandName("claude"),
     buildArgs: async ({ workingDir, sessionState }) => {
       const sessionId = cleanSessionId(sessionState?.sessionId);
+      const permissionMode = getClaudePermissionMode();
+      const allowedTools = getClaudeAllowedTools();
+      const settingsFile = await findClaudeSettingsFile(workingDir);
       const args = [
         "--print",
         "--input-format",
         "text",
         "--output-format",
         "json",
-        "--permission-mode",
-        "bypassPermissions",
-        "--add-dir",
-        workingDir,
       ];
+
+      if (shouldUseClaudeDangerouslySkipPermissions()) {
+        if (!canUseClaudeBypassPermissions()) {
+          throw new Error(
+            "CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=1 已开启，但当前 Web 服务以 root/sudo 运行；Claude Code 会拒绝该模式。请用普通用户启动服务后再开启。",
+          );
+        }
+        args.push("--dangerously-skip-permissions");
+      } else {
+        args.push("--permission-mode", permissionMode);
+      }
+
+      if (settingsFile) {
+        args.push("--settings", settingsFile);
+      }
+
+      if (!shouldUseClaudeDangerouslySkipPermissions() && allowedTools.length > 0) {
+        args.push("--allowedTools", ...allowedTools);
+      }
+
+      args.push("--add-dir", workingDir);
 
       if (sessionId) {
         args.push("--resume", sessionId);
@@ -125,10 +145,22 @@ const AGENTS = {
       return { args, sessionId, workingDir };
     },
     readResult: async (result) => {
-      const parsed = parseJsonObject(result.stdout);
+      const parsed = parseJsonObject(result.stdout) || parseJsonObject(result.stderr);
+      const permissionDenial = formatClaudePermissionDenials(parsed?.permission_denials);
+      if (permissionDenial) {
+        throw new Error(permissionDenial);
+      }
       const reply = cleanCliText(
-        parsed?.result || parsed?.content || parsed?.message || parsed?.text || result.stdout,
+        parsed?.result ||
+          parsed?.content ||
+          parsed?.message ||
+          parsed?.text ||
+          result.stdout ||
+          result.stderr,
       );
+      if (parsed?.is_error && reply) {
+        throw new Error(reply);
+      }
       const sessionId =
         cleanSessionId(parsed?.session_id) ||
         cleanSessionId(parsed?.sessionId) ||
@@ -144,6 +176,74 @@ const AGENTS = {
 
 function commandName(base) {
   return process.platform === "win32" ? `${base}.cmd` : base;
+}
+
+function canUseClaudeBypassPermissions() {
+  return (
+    process.platform === "win32" ||
+    ((typeof process.getuid !== "function" || process.getuid() !== 0) &&
+      !process.env.SUDO_UID &&
+      !process.env.SUDO_GID &&
+      !process.env.SUDO_USER)
+  );
+}
+
+function getClaudePermissionMode() {
+  return canUseClaudeBypassPermissions() ? "bypassPermissions" : "acceptEdits";
+}
+
+function shouldUseClaudeDangerouslySkipPermissions() {
+  return readBooleanEnv("CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS");
+}
+
+function getClaudeAllowedTools() {
+  if (Object.prototype.hasOwnProperty.call(process.env, "CLAUDE_ALLOWED_TOOLS")) {
+    return String(process.env.CLAUDE_ALLOWED_TOOLS || "")
+      .split(/[,\n]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  return DEFAULT_CLAUDE_ALLOWED_TOOLS;
+}
+
+function formatClaudePermissionDenials(denials) {
+  if (!Array.isArray(denials) || denials.length === 0) return "";
+
+  const details = denials
+    .slice(0, 3)
+    .map((denial) => {
+      const tool = cleanCliText(denial?.tool_name || "tool");
+      const input = denial?.tool_input || {};
+      const command = cleanCliText(input.command || input.file_path || input.path || "");
+      return command ? `${tool}: ${command}` : tool;
+    })
+    .filter(Boolean);
+
+  const suffix = denials.length > details.length ? ` 等 ${denials.length} 个操作` : "";
+  return `Claude Code 权限拒绝：${details.join("；")}${suffix}`;
+}
+
+async function findClaudeSettingsFile(workingDir) {
+  const configured = String(process.env.CLAUDE_SETTINGS_FILE || "").trim();
+  if (configured) {
+    return path.resolve(configured);
+  }
+
+  let current = path.resolve(workingDir || ROOT);
+  while (true) {
+    const candidate = path.join(current, ".claude", "settings.json");
+    try {
+      await fsp.access(candidate, fs.constants.R_OK);
+      return candidate;
+    } catch {
+      // Walk up to the filesystem root.
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) return "";
+    current = parent;
+  }
 }
 
 function createServer(options = {}) {
@@ -172,8 +272,9 @@ async function routeRequest(request, response, context) {
   }
 
   const url = new URL(request.url, "http://localhost");
+  const routePath = normalizeRoutePath(url.pathname);
 
-  if (request.method === "GET" && url.pathname === "/api/health") {
+  if (request.method === "GET" && routePath === "/api/health") {
     sendJson(response, 200, {
       ok: true,
       agentTimeoutMs: AGENT_TIMEOUT_MS,
@@ -185,38 +286,38 @@ async function routeRequest(request, response, context) {
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/api/cache/state") {
-    const state = await readOpenState();
+  if (request.method === "GET" && routePath === "/api/cache/state") {
+    const state = await readOpenState({ persistInterrupted: true });
     sendJson(response, 200, state);
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/cache/state") {
+  if (request.method === "POST" && routePath === "/api/cache/state") {
     await handleSaveState(request, response);
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/api/cache/rooms") {
+  if (request.method === "GET" && routePath === "/api/cache/rooms") {
     await handleListCachedRooms(url, response);
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/api/jobs") {
+  if (request.method === "GET" && routePath === "/api/jobs") {
     sendJson(response, 200, { jobs: [...BACKGROUND_JOBS.values()] });
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/api/schedules") {
+  if (request.method === "GET" && routePath === "/api/schedules") {
     await handleListSchedules(response);
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/schedules") {
+  if (request.method === "POST" && routePath === "/api/schedules") {
     await handleCreateSchedule(request, response);
     return;
   }
 
-  const scheduleMatch = url.pathname.match(/^\/api\/schedules\/([^/]+)$/);
+  const scheduleMatch = routePath.match(/^\/api\/schedules\/([^/]+)$/);
   if (scheduleMatch) {
     if (request.method === "PATCH") {
       await handleUpdateSchedule(request, response, scheduleMatch[1]);
@@ -229,28 +330,35 @@ async function routeRequest(request, response, context) {
     }
   }
 
-  if (request.method === "GET" && url.pathname === "/api/paths/browse") {
+  if (request.method === "GET" && routePath === "/api/paths/browse") {
     await handleBrowsePath(url, response);
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/api/paths/resolve") {
+  if (request.method === "POST" && routePath === "/api/paths/resolve") {
     await handleResolvePath(request, response);
     return;
   }
 
-  const replyMatch = url.pathname.match(/^\/api\/agents\/([a-z]+)\/reply$/);
+  const replyMatch = routePath.match(/^\/api\/agents\/([a-z]+)\/reply$/);
   if (request.method === "POST" && replyMatch) {
     await handleAgentReply(request, response, replyMatch[1], context);
     return;
   }
 
   if (request.method === "GET") {
-    await serveStatic(url.pathname, response);
+    await serveStatic(routePath, response);
     return;
   }
 
   sendJson(response, 405, { error: "Method not allowed" });
+}
+
+function normalizeRoutePath(pathname) {
+  const text = String(pathname || "/");
+  const apiIndex = text.indexOf("/api/");
+  if (apiIndex > 0) return text.slice(apiIndex);
+  return text;
 }
 
 async function handleResolvePath(request, response) {
@@ -515,6 +623,8 @@ async function runBackgroundAgentJob({
       errorMessage: job.error,
       context,
     });
+  } finally {
+    BACKGROUND_JOBS.delete(job.id);
   }
 }
 
@@ -621,6 +731,7 @@ async function runAgent(agentConfig, prompt, options = {}) {
     const result = await runProcess(agentConfig.command, commandSetup.args, prompt, {
       signal: options.signal,
       cwd: workingDir,
+      ...(commandSetup.spawnOptions || {}),
     });
     const agentResult = await agentConfig.readResult({ ...result, ...commandSetup });
     const { reply, sessionState } = normalizeAgentResult(agentResult);
@@ -645,12 +756,16 @@ function runProcess(command, args, stdinText, options = {}) {
       return;
     }
 
-    const child = spawn(command, args, {
+    const spawnOptions = {
       cwd: options.cwd || ROOT,
-      env: process.env,
+      env: options.env || process.env,
       shell: process.platform === "win32",
       windowsHide: true,
-    });
+    };
+    if (Number.isInteger(options.uid)) spawnOptions.uid = options.uid;
+    if (Number.isInteger(options.gid)) spawnOptions.gid = options.gid;
+
+    const child = spawn(command, args, spawnOptions);
 
     let stdout = "";
     let stderr = "";
@@ -733,9 +848,14 @@ function runProcess(command, args, stdinText, options = {}) {
 }
 
 async function resolveWorkingDirectory(value) {
-  const rawPath = String(value || "").trim();
-  const candidate = rawPath
-    ? path.resolve(path.isAbsolute(rawPath) ? rawPath : path.join(ROOT, rawPath))
+  const rawPath = normalizeInputPath(value);
+  if (rawPath && isForeignWindowsAbsolutePath(rawPath)) {
+    throw new HttpError(400, `Windows path cannot be used on this host: ${rawPath}`);
+  }
+
+  const expandedPath = expandHomePath(rawPath);
+  const candidate = expandedPath
+    ? path.resolve(path.isAbsolute(expandedPath) ? expandedPath : path.join(ROOT, expandedPath))
     : ROOT;
 
   let stats;
@@ -752,7 +872,34 @@ async function resolveWorkingDirectory(value) {
   return candidate;
 }
 
-async function readOpenState() {
+function isForeignWindowsAbsolutePath(value) {
+  if (process.platform === "win32") return false;
+  const text = String(value || "");
+  return /^[a-zA-Z]:[\\/]/.test(text) || /^\\\\[^\\]+\\[^\\]+/.test(text);
+}
+
+function expandHomePath(value) {
+  const text = String(value || "");
+  if (text === "~") return os.homedir();
+  if (text.startsWith("~/") || text.startsWith("~\\")) {
+    return path.join(os.homedir(), text.slice(2));
+  }
+  return text;
+}
+
+function normalizeInputPath(value) {
+  let text = String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  if (
+    (text.startsWith("\"") && text.endsWith("\"")) ||
+    (text.startsWith("'") && text.endsWith("'")) ||
+    (text.startsWith("`") && text.endsWith("`"))
+  ) {
+    text = text.slice(1, -1).trim();
+  }
+  return text;
+}
+
+async function readOpenState(options = {}) {
   const state = await readJsonFile(OPEN_STATE_FILE, null);
   if (!state || !Array.isArray(state.rooms)) {
     return {
@@ -764,13 +911,76 @@ async function readOpenState() {
   }
 
   const rooms = state.rooms.map((room) => normalizeStoredRoom(room)).filter(Boolean);
+  const interrupted = reconcileInterruptedRooms(rooms);
+  let savedAt = state.savedAt || null;
+
+  if (interrupted && options.persistInterrupted) {
+    const result = await writeOpenRoomsState(rooms, state.activeRoomId);
+    savedAt = result.savedAt;
+  }
+
   return {
     exists: true,
     version: 1,
-    savedAt: state.savedAt || null,
+    savedAt,
     activeRoomId: rooms.some((room) => room.id === state.activeRoomId) ? state.activeRoomId : null,
     rooms,
   };
+}
+
+function reconcileInterruptedRooms(rooms, now = new Date().toISOString()) {
+  if (!Array.isArray(rooms) || rooms.length === 0) return false;
+
+  const nowMs = Date.parse(now) || Date.now();
+  const trackedJobIds = new Set();
+  const trackedAgentKeys = new Set();
+  for (const job of BACKGROUND_JOBS.values()) {
+    if (!job) continue;
+    trackedJobIds.add(job.id);
+    trackedAgentKeys.add(`${job.roomId}:${job.agentId}`);
+  }
+
+  let changed = false;
+
+  for (const room of rooms) {
+    if (!room || typeof room !== "object") continue;
+
+    let roomChanged = false;
+    const keptTypingAgentIds = new Set();
+    for (const message of room.messages || []) {
+      if (!message?.typing) continue;
+
+      const jobId = String(message.jobId || "");
+      const hasTrackedJob = jobId && trackedJobIds.has(jobId);
+      const isRecentUnregisteredTyping =
+        !jobId && nowMs - (Date.parse(message.createdAt) || 0) < STALE_UNREGISTERED_TYPING_MS;
+
+      if (hasTrackedJob || isRecentUnregisteredTyping) {
+        if (message.agentId) keptTypingAgentIds.add(String(message.agentId));
+        continue;
+      }
+
+      message.typing = false;
+      message.text = "真实 agent 调用已中断：服务已重启或关闭，后台任务不存在";
+      roomChanged = true;
+      changed = true;
+    }
+
+    for (const agent of room.agents || []) {
+      if (!agent?.replying) continue;
+      const hasTrackedJob = trackedAgentKeys.has(`${room.id}:${agent.id}`);
+      if (hasTrackedJob || keptTypingAgentIds.has(String(agent.id))) continue;
+      agent.replying = false;
+      roomChanged = true;
+      changed = true;
+    }
+
+    if (roomChanged) {
+      room.updatedAt = now;
+    }
+  }
+
+  return changed;
 }
 
 async function readPathCache(workingDir) {
@@ -795,6 +1005,7 @@ async function readPathCache(workingDir) {
 async function writeOpenRoomsState(rooms, activeRoomId) {
   const savedAt = new Date().toISOString();
   const cleanRooms = rooms.map((room) => normalizeStoredRoom(room)).filter(Boolean);
+  reconcileInterruptedRooms(cleanRooms, savedAt);
   const state = {
     version: 1,
     savedAt,
@@ -1168,8 +1379,6 @@ async function dispatchScheduledPrompt(schedule) {
   agent.replying = true;
   room.messages.push(sourceMessage, typingMessage);
   room.updatedAt = now;
-  await upsertOpenRoom(room, state.activeRoomId || room.id, true);
-
   const job = {
     id: jobId,
     type: agent.type,
@@ -1183,6 +1392,7 @@ async function dispatchScheduledPrompt(schedule) {
     scheduleId: schedule.id,
   };
   BACKGROUND_JOBS.set(jobId, job);
+  await upsertOpenRoom(room, state.activeRoomId || room.id, true);
 
   runBackgroundAgentJob({
     job,
@@ -1376,8 +1586,14 @@ async function readJsonFile(filePath, fallback) {
 }
 
 async function writeJsonFile(filePath, data) {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  await fsp.writeFile(filePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  const directory = path.dirname(filePath);
+  const tempFile = path.join(
+    directory,
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  await fsp.mkdir(directory, { recursive: true });
+  await fsp.writeFile(tempFile, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  await fsp.rename(tempFile, filePath);
 }
 
 function parseJsonObject(value) {
@@ -1528,7 +1744,10 @@ async function serveStatic(urlPath, response) {
   try {
     const file = await fsp.readFile(filePath);
     const contentType = CONTENT_TYPES[path.extname(filePath)] || "application/octet-stream";
-    response.writeHead(200, { "Content-Type": contentType });
+    response.writeHead(200, {
+      "Content-Type": contentType,
+      "Cache-Control": "no-store",
+    });
     response.end(file);
   } catch (error) {
     if (error.code === "ENOENT") {
@@ -1606,6 +1825,10 @@ function readPositiveIntegerEnv(name, fallback) {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+function readBooleanEnv(name) {
+  return /^(1|true|yes|on)$/i.test(String(process.env[name] || "").trim());
+}
+
 class HttpError extends Error {
   constructor(statusCode, message) {
     super(message);
@@ -1622,7 +1845,10 @@ if (require.main === module) {
 module.exports = {
   AGENTS,
   buildPrompt,
+  canUseClaudeBypassPermissions,
   createServer,
+  getClaudeAllowedTools,
+  getClaudePermissionMode,
   getPathCacheFile,
   hasUserMessage,
   readOpenState,

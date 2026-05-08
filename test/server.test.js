@@ -15,8 +15,12 @@ process.env.AGENTDISCUSSION_SCHEDULE_FILE = path.join(
 );
 
 const {
+  AGENTS,
   buildPrompt,
+  canUseClaudeBypassPermissions,
   createServer,
+  getClaudeAllowedTools,
+  getClaudePermissionMode,
   getPathCacheFile,
   readPathCache,
   resolveWorkingDirectory,
@@ -43,9 +47,108 @@ test("health endpoint exposes available agents and timeout", async () => {
   }
 });
 
+test("Codex uses the CLI default sandbox for new sessions", async () => {
+  const setup = await AGENTS.codex.buildArgs({ workingDir: ROOT, sessionState: {} });
+  assert.equal(setup.args.includes("--sandbox"), false);
+  assert.equal(setup.args.includes("read-only"), false);
+  assert.ok(setup.args.includes("--cd"));
+});
+
+test("Claude Code uses a root-safe permission mode", async () => {
+  const setup = await AGENTS.claudecode.buildArgs({ workingDir: ROOT, sessionState: {} });
+  const permissionModeIndex = setup.args.indexOf("--permission-mode");
+  assert.ok(permissionModeIndex >= 0);
+  assert.equal(setup.args[permissionModeIndex + 1], getClaudePermissionMode());
+  assert.equal(setup.args.includes("bypassPermissions"), canUseClaudeBypassPermissions());
+
+  const allowedToolsIndex = setup.args.indexOf("--allowedTools");
+  assert.ok(allowedToolsIndex >= 0);
+  assert.deepEqual(
+    setup.args.slice(allowedToolsIndex + 1, allowedToolsIndex + 1 + getClaudeAllowedTools().length),
+    getClaudeAllowedTools(),
+  );
+});
+
+test("Claude Code parses stderr JSON and reports CLI errors", async () => {
+  const sessionId = "11111111-2222-3333-4444-555555555555";
+  const result = await AGENTS.claudecode.readResult({
+    stdout: "",
+    stderr: JSON.stringify({ result: "OK", session_id: sessionId }),
+  });
+  assert.deepEqual(result, {
+    reply: "OK",
+    sessionState: { sessionId },
+  });
+
+  await assert.rejects(
+    () =>
+      AGENTS.claudecode.readResult({
+        stdout: "",
+        stderr: JSON.stringify({ is_error: true, result: "permission denied" }),
+      }),
+    /permission denied/,
+  );
+
+  await assert.rejects(
+    () =>
+      AGENTS.claudecode.readResult({
+        stdout: JSON.stringify({
+          result: "DONE",
+          permission_denials: [
+            {
+              tool_name: "Bash",
+              tool_input: { command: "python3 -c \"write()\"" },
+            },
+          ],
+        }),
+        stderr: "",
+      }),
+    /Claude Code 权限拒绝：Bash: python3/,
+  );
+});
+
+test("Claude Code dangerous skip mode refuses root server processes", async (t) => {
+  if (canUseClaudeBypassPermissions()) {
+    t.skip("This host can use Claude bypass permissions directly");
+    return;
+  }
+
+  const previous = process.env.CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS;
+  process.env.CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS = "1";
+  try {
+    await assert.rejects(
+      () => AGENTS.claudecode.buildArgs({ workingDir: ROOT, sessionState: {} }),
+      /root\/sudo/,
+    );
+  } finally {
+    if (previous === undefined) {
+      delete process.env.CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS;
+    } else {
+      process.env.CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS = previous;
+    }
+  }
+});
+
 test("path resolver accepts relative and absolute directories", async () => {
   assert.equal(await resolveWorkingDirectory("."), ROOT);
   assert.equal(await resolveWorkingDirectory(ROOT), ROOT);
+  assert.equal(await resolveWorkingDirectory(`"${ROOT}"`), ROOT);
+});
+
+test("path resolver expands home shorthand", async () => {
+  assert.equal(await resolveWorkingDirectory("~"), os.homedir());
+});
+
+test("path resolver rejects foreign Windows absolute paths on non-Windows hosts", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("Windows hosts should keep native Windows path behavior");
+    return;
+  }
+
+  await assert.rejects(
+    () => resolveWorkingDirectory("C:\\Users\\agentdiscussion"),
+    /Windows path cannot be used on this host/,
+  );
 });
 
 test("path resolver endpoint rejects missing directories", async () => {
@@ -88,6 +191,26 @@ test("path browser lists parent and child directories", async () => {
   } finally {
     await close(server);
     await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("api routes work behind a path-prefixed proxy", async () => {
+  const server = createServer();
+  const port = await listen(server);
+
+  try {
+    const health = await requestJson(port, "/proxy/5173/api/health");
+    assert.equal(health.statusCode, 200);
+    assert.equal(health.body.ok, true);
+
+    const browse = await requestJson(
+      port,
+      `/proxy/5173/api/paths/browse?path=${encodeURIComponent(ROOT)}`,
+    );
+    assert.equal(browse.statusCode, 200);
+    assert.equal(browse.body.workingDir, ROOT);
+  } finally {
+    await close(server);
   }
 });
 
@@ -675,6 +798,9 @@ test("static root serves the chat page", async () => {
     assert.match(response.body, /cacheDialog/);
     assert.match(response.body, /cacheRoomChoices/);
     assert.match(response.body, /pathDialog/);
+    assert.match(response.body, /pathDialogInput/);
+    assert.match(response.body, /pathHistoryList/);
+    assert.match(response.body, /openPathInput/);
     assert.match(response.body, /pathDirectoryList/);
     assert.match(response.body, /selectNewRoomPath/);
     assert.match(response.body, /selectRoomPath/);
@@ -793,6 +919,78 @@ test("cache state persists open rooms but path cache only keeps rooms with user 
   } finally {
     await close(server);
     await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("cache state marks orphaned running jobs interrupted after restart", async () => {
+  const stateFile = process.env.AGENTDISCUSSION_STATE_FILE;
+  await fsp.writeFile(
+    stateFile,
+    `${JSON.stringify(
+      {
+        version: 1,
+        savedAt: "2026-01-01T00:00:00.000Z",
+        activeRoomId: "room-stale-job",
+        rooms: [
+          {
+            id: "room-stale-job",
+            name: "Stale Job",
+            workingDir: ROOT,
+            agents: [
+              {
+                id: "agent-stale",
+                type: "codex",
+                name: "Codex-1",
+                label: "Codex 1",
+                replying: true,
+              },
+            ],
+            messages: [
+              {
+                id: "user-stale",
+                sender: "user",
+                author: "你",
+                text: "@Codex-1 run",
+                createdAt: "2026-01-01T00:00:00.000Z",
+              },
+              {
+                id: "typing-stale",
+                sender: "agent",
+                author: "Codex 1",
+                agentId: "agent-stale",
+                text: "正在处理",
+                typing: true,
+                jobId: "job-stale-after-restart",
+                createdAt: "2026-01-01T00:00:01.000Z",
+              },
+            ],
+          },
+        ],
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+
+  const server = createServer();
+  const port = await listen(server);
+
+  try {
+    const response = await requestJson(port, "/api/cache/state");
+    assert.equal(response.statusCode, 200);
+    const room = response.body.rooms.find((item) => item.id === "room-stale-job");
+    assert.equal(room.agents[0].replying, false);
+    const typing = room.messages.find((message) => message.id === "typing-stale");
+    assert.equal(typing.typing, false);
+    assert.match(typing.text, /已中断/);
+
+    const persisted = JSON.parse(await fsp.readFile(stateFile, "utf8"));
+    const persistedRoom = persisted.rooms.find((item) => item.id === "room-stale-job");
+    assert.equal(persistedRoom.agents[0].replying, false);
+    assert.equal(persistedRoom.messages.find((message) => message.id === "typing-stale").typing, false);
+  } finally {
+    await close(server);
   }
 });
 
