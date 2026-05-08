@@ -1,0 +1,13 @@
+node_modules/
+
+.mca/
+.agentdiscussion-cache/
+**/.agentdiscussion-cache/
+
+.env
+.env.*
+*.log
+
+coverage/
+dist/
+build/

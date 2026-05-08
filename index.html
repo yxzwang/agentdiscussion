@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent 群聊</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="agent-panel" aria-label="Agent 列表">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Workspace</p>
+            <h1>Agent 群聊</h1>
+          </div>
+          <span class="count-pill" id="agentCount">0</span>
+        </div>
+
+        <section class="room-manager" aria-label="讨论组">
+          <div class="section-head">
+            <span>讨论组</span>
+            <span class="cache-status" id="cacheStatus"></span>
+          </div>
+          <div class="room-list" id="roomList"></div>
+          <div class="room-create">
+            <input id="newRoomName" type="text" placeholder="新讨论组名称" />
+            <div class="path-input-group">
+              <input id="newRoomPath" type="text" placeholder="运行路径" />
+              <button class="path-picker-button" id="selectNewRoomPath" type="button">选择</button>
+            </div>
+            <button class="secondary-action" id="createRoom" type="button">新建</button>
+          </div>
+        </section>
+
+        <section class="agent-builder" aria-label="创建 agent">
+          <div class="segmented" role="radiogroup" aria-label="Agent 类型">
+            <label class="segment">
+              <input type="radio" name="agentType" value="codex" checked />
+              <span>Codex</span>
+            </label>
+            <label class="segment">
+              <input type="radio" name="agentType" value="claudecode" />
+              <span>Claude Code</span>
+            </label>
+          </div>
+          <button class="primary-action" id="addAgent" type="button">
+            <span aria-hidden="true">+</span>
+            <span>创建</span>
+          </button>
+        </section>
+
+        <div class="agent-list" id="agentList"></div>
+      </aside>
+
+      <section class="chat-panel" aria-label="群聊">
+        <header class="chat-head">
+          <div>
+            <p class="eyebrow">Room</p>
+            <h2 id="roomTitle">讨论组</h2>
+            <p class="room-path" id="roomPathLabel"></p>
+          </div>
+          <div class="room-settings" aria-label="讨论组设置">
+            <input id="roomNameInput" type="text" aria-label="讨论组名称" />
+            <div class="path-input-group">
+              <input id="roomPathInput" type="text" aria-label="运行路径" />
+              <button class="path-picker-button" id="selectRoomPath" type="button">选择</button>
+            </div>
+            <button class="secondary-action" id="saveRoomSettings" type="button">保存</button>
+            <span class="path-status" id="pathStatus" aria-live="polite"></span>
+          </div>
+          <div class="room-status">
+            <span id="mutedStatus">全部静默</span>
+            <span id="clock"></span>
+          </div>
+        </header>
+
+        <div class="message-list" id="messageList" aria-live="polite"></div>
+
+        <footer class="composer">
+          <div class="mention-strip" id="mentionStrip"></div>
+          <label class="sr-only" for="messageInput">消息</label>
+          <textarea
+            id="messageInput"
+            rows="3"
+            placeholder="@Codex-1 帮我拆一下任务"
+          ></textarea>
+          <div class="composer-actions">
+            <span class="hint" id="replyHint">被 @ 的 agent 会调用真实后端</span>
+            <button class="send-action" id="sendMessage" type="button">发送</button>
+          </div>
+        </footer>
+      </section>
+
+      <aside class="schedule-panel" aria-label="定时任务">
+        <div class="panel-head compact-head">
+          <div>
+            <p class="eyebrow">Schedules</p>
+            <h2>定时任务</h2>
+          </div>
+          <button class="primary-action icon-action" id="createSchedule" type="button" title="新建定时任务" aria-label="新建定时任务">
+            <span aria-hidden="true">+</span>
+          </button>
+        </div>
+        <div class="schedule-list" id="scheduleList"></div>
+      </aside>
+
+      <button
+        class="resize-handle"
+        id="resizeHandle"
+        type="button"
+        aria-label="调整界面大小"
+        title="拖动调整界面大小"
+      ></button>
+    </main>
+
+    <div class="modal-backdrop" id="cacheDialog" hidden>
+      <section class="cache-dialog" role="dialog" aria-modal="true" aria-labelledby="cacheDialogTitle">
+        <header class="cache-dialog-head">
+          <div>
+            <p class="eyebrow">Cache</p>
+            <h2 id="cacheDialogTitle">选择要恢复的讨论组</h2>
+          </div>
+          <button class="room-command close" id="closeCacheDialog" type="button" aria-label="关闭缓存选择">×</button>
+        </header>
+        <div class="cache-room-choices" id="cacheRoomChoices"></div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="pathDialog" hidden>
+      <section class="path-dialog" role="dialog" aria-modal="true" aria-labelledby="pathDialogTitle">
+        <header class="cache-dialog-head">
+          <div>
+            <p class="eyebrow">Path</p>
+            <h2 id="pathDialogTitle">选择路径</h2>
+          </div>
+          <button class="room-command close" id="closePathDialog" type="button" aria-label="关闭路径选择">×</button>
+        </header>
+        <div class="path-dialog-body">
+          <div class="path-current">
+            <div class="path-current-main">
+              <span class="path-current-label">当前路径</span>
+              <span class="path-current-value" id="pathDialogCurrent"></span>
+            </div>
+            <button class="secondary-action" id="chooseCurrentPath" type="button">选择此路径</button>
+          </div>
+          <div class="path-nav">
+            <button class="path-nav-button" id="pathBack" type="button">后退</button>
+            <button class="path-nav-button" id="pathForward" type="button">前进</button>
+            <button class="path-nav-button" id="pathParent" type="button">上一级</button>
+          </div>
+          <div class="path-directory-list" id="pathDirectoryList"></div>
+          <span class="path-dialog-status" id="pathDialogStatus" aria-live="polite"></span>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="scheduleDialog" hidden>
+      <section class="schedule-dialog" role="dialog" aria-modal="true" aria-labelledby="scheduleDialogTitle">
+        <header class="cache-dialog-head">
+          <div>
+            <p class="eyebrow">Schedule</p>
+            <h2 id="scheduleDialogTitle">新建定时任务</h2>
+          </div>
+          <button class="room-command close" id="closeScheduleDialog" type="button" aria-label="关闭定时任务">×</button>
+        </header>
+        <div class="schedule-dialog-body">
+          <label class="field-label" for="scheduleAgent">Agent</label>
+          <select class="field-control" id="scheduleAgent"></select>
+
+          <label class="field-label" for="scheduleInterval">时间间隔</label>
+          <div class="interval-row">
+            <input id="scheduleInterval" type="number" min="1" value="5" />
+            <select class="field-control" id="scheduleIntervalUnit">
+              <option value="1000">秒</option>
+              <option value="60000" selected>分钟</option>
+              <option value="3600000">小时</option>
+            </select>
+          </div>
+
+          <label class="field-label" for="schedulePrompt">Prompt</label>
+          <textarea id="schedulePrompt" rows="5" placeholder="发送给 agent 的 prompt"></textarea>
+
+          <div class="dialog-actions">
+            <span class="path-dialog-status" id="scheduleStatus" aria-live="polite"></span>
+            <button class="secondary-action" id="saveSchedule" type="button">确认创建</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

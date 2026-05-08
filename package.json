@@ -1,0 +1,14 @@
+{
+  "name": "agentdiscussion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/server.test.js",
+    "check": "node --check app.js && node --check server.js && node test/server.test.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.59.1"
+  }
+}
