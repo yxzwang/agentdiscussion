@@ -18,6 +18,7 @@ const {
   buildPrompt,
   createServer,
   getPathCacheFile,
+  markInterruptedLostJobs,
   readPathCache,
   resolveWorkingDirectory,
 } = require("../server");
@@ -794,6 +795,72 @@ test("cache state persists open rooms but path cache only keeps rooms with user 
     await close(server);
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test("open state recovery marks stale running agent jobs as interrupted", () => {
+  const processStartedAt = Date.now();
+  const staleCreatedAt = new Date(processStartedAt - 10_000).toISOString();
+  const freshCreatedAt = new Date(processStartedAt + 10_000).toISOString();
+  const rooms = [
+    {
+      id: "room-stale-job",
+      name: "Stale job room",
+      workingDir: ROOT,
+      agents: [
+        {
+          id: "agent-stale",
+          type: "codex",
+          name: "Codex-1",
+          label: "Codex 1",
+          replying: true,
+        },
+        {
+          id: "agent-fresh",
+          type: "codex",
+          name: "Codex-2",
+          label: "Codex 2",
+          replying: true,
+        },
+      ],
+      messages: [
+        {
+          id: "typing-stale",
+          sender: "agent",
+          agentId: "agent-stale",
+          author: "Codex 1",
+          text: "processing",
+          typing: true,
+          jobId: "job-from-dead-process",
+          createdAt: staleCreatedAt,
+        },
+        {
+          id: "typing-fresh",
+          sender: "agent",
+          agentId: "agent-fresh",
+          author: "Codex 2",
+          text: "processing",
+          typing: true,
+          jobId: "job-from-current-process",
+          createdAt: freshCreatedAt,
+        },
+      ],
+    },
+  ];
+
+  assert.equal(markInterruptedLostJobs(rooms, processStartedAt), true);
+
+  const staleMessage = rooms[0].messages.find((message) => message.id === "typing-stale");
+  assert.equal(staleMessage.typing, false);
+  assert.equal(
+    staleMessage.text,
+    "\u5df2\u4e2d\u65ad\uff1a\u670d\u52a1\u5173\u95ed\u540e\u8be5\u4efb\u52a1\u672a\u80fd\u7ee7\u7eed\u8fd0\u884c",
+  );
+  assert.equal(rooms[0].agents.find((agent) => agent.id === "agent-stale").replying, false);
+
+  const freshMessage = rooms[0].messages.find((message) => message.id === "typing-fresh");
+  assert.equal(freshMessage.typing, true);
+  assert.equal(freshMessage.text, "processing");
+  assert.equal(rooms[0].agents.find((agent) => agent.id === "agent-fresh").replying, true);
 });
 
 test("scheduled tasks can trigger prompts and be stopped or deleted", async () => {

@@ -18,6 +18,7 @@ const SCHEDULE_STATE_FILE =
   process.env.AGENTDISCUSSION_SCHEDULE_FILE || path.join(APP_DATA_DIR, "schedules.json");
 const PATH_CACHE_DIR = ".agentdiscussion-cache";
 const PATH_CACHE_FILE = "rooms.json";
+const PROCESS_STARTED_AT = Date.now();
 const BACKGROUND_JOBS = new Map();
 const SCHEDULE_TIMERS = new Map();
 const MIN_SCHEDULE_INTERVAL_MS = 100;
@@ -74,8 +75,6 @@ const AGENTS = {
           "never",
           "exec",
           "--skip-git-repo-check",
-          "--sandbox",
-          "read-only",
           "--cd",
           workingDir,
           "--color",
@@ -764,6 +763,11 @@ async function readOpenState() {
   }
 
   const rooms = state.rooms.map((room) => normalizeStoredRoom(room)).filter(Boolean);
+  const interrupted = markInterruptedLostJobs(rooms);
+  if (interrupted) {
+    await writeOpenRoomsState(rooms, state.activeRoomId);
+  }
+
   return {
     exists: true,
     version: 1,
@@ -805,6 +809,49 @@ async function writeOpenRoomsState(rooms, activeRoomId) {
   await writeJsonFile(OPEN_STATE_FILE, state);
   const cacheResults = await writePathCaches(cleanRooms, savedAt);
   return { savedAt, cacheResults };
+}
+
+function markInterruptedLostJobs(rooms, processStartedAt = PROCESS_STARTED_AT) {
+  let changed = false;
+
+  for (const room of rooms) {
+    for (const message of room.messages) {
+      if (!isInterruptedTypingMessage(message, processStartedAt)) continue;
+
+      message.typing = false;
+      message.text = "已中断：服务关闭后该任务未能继续运行";
+      changed = true;
+    }
+
+    for (const agent of room.agents) {
+      const hasLiveTyping = room.messages.some(
+        (message) =>
+          message.typing &&
+          message.agentId === agent.id &&
+          !isInterruptedTypingMessage(message, processStartedAt),
+      );
+      if (agent.replying && !hasLiveTyping) {
+        agent.replying = false;
+        changed = true;
+      }
+    }
+  }
+
+  return changed;
+}
+
+function isInterruptedTypingMessage(message, processStartedAt = PROCESS_STARTED_AT) {
+  if (!message.typing) return false;
+  if (isLiveTypingMessage(message)) return false;
+
+  const createdAt = new Date(message.createdAt || 0).getTime();
+  return !Number.isFinite(createdAt) || createdAt < processStartedAt;
+}
+
+function isLiveTypingMessage(message) {
+  const jobId = String(message.jobId || "");
+  if (!jobId) return false;
+  return BACKGROUND_JOBS.get(jobId)?.status === "running";
 }
 
 async function upsertOpenRoom(room, activeRoomId, addIfMissing) {
@@ -1625,6 +1672,7 @@ module.exports = {
   createServer,
   getPathCacheFile,
   hasUserMessage,
+  markInterruptedLostJobs,
   readOpenState,
   readPathCache,
   resolveWorkingDirectory,
