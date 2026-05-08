@@ -550,8 +550,8 @@ function buildPrompt({ type, agent, room, workingDir, message, cleanMessage, con
     `你的群聊昵称是 ${agent.label || agent.name || "Agent"}。`,
     `本次运行目录是 ${workingDir || ROOT}。`,
     agentDirectory ? `当前讨论组可点名的 agent：${agentDirectory}。` : "",
-    "你在一个多 agent 群聊里。默认所有 agent 都静默，只有当前消息明确 @ 你时，你才会被后端调用并回复。",
-    "如果你需要把后续任务分配给其他 agent，可以在回复中明确 @它的昵称；后端会继续调用被 @ 的 agent。",
+    "你在一个多 agent 群聊里。默认所有 agent 都静默，只有消息开头明确 @ 你时，你才会被后端调用并回复。",
+    "如果你需要把后续任务分配给其他 agent，必须把 @它的昵称 放在回复最开头；正文中间提到 @昵称 只会被视为普通文本，不会触发后续调用。",
     "请只回复这次被 @ 的消息，不要替其他 agent 发言，不要声称自己已经修改文件。",
     "回复要适合直接显示在群聊里，简洁、具体、中文优先。",
     "",
@@ -924,29 +924,37 @@ async function startMentionedAgentJob({ room, sourceMessage, target, activeRoomI
 }
 
 function getMentionedAgents(text, room) {
-  const matches = new Set();
-
-  room.agents.forEach((agent) => {
-    const pattern = new RegExp(
-      `(^|\\s)@${escapeRegExp(agent.name)}(?=$|\\s|[,.!?，。！？:：；;])`,
-      "i",
-    );
-
-    if (pattern.test(text)) {
-      matches.add(agent.id);
-    }
-  });
-
-  return room.agents.filter((agent) => matches.has(agent.id));
+  const { agentIds } = consumeLeadingMentions(text, room);
+  return room.agents.filter((agent) => agentIds.has(agent.id));
 }
 
 function stripMentions(text, room) {
-  return room.agents
-    .reduce((value, agent) => {
-      const pattern = new RegExp(`@${escapeRegExp(agent.name)}`, "gi");
-      return value.replace(pattern, "");
-    }, text)
-    .trim();
+  return consumeLeadingMentions(text, room).rest.trim();
+}
+
+function consumeLeadingMentions(text, room) {
+  let rest = String(text || "").trimStart();
+  const agentIds = new Set();
+
+  while (rest.startsWith("@")) {
+    const match = room.agents
+      .map((agent) => {
+        const pattern = new RegExp(
+          `^@${escapeRegExp(agent.name)}(?=$|\\s|[,.!?，。！？:：；;])`,
+          "i",
+        );
+        const matched = rest.match(pattern);
+        return matched ? { agent, length: matched[0].length } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)[0];
+
+    if (!match) break;
+    agentIds.add(match.agent.id);
+    rest = rest.slice(match.length).replace(/^[\s,.!?，。！？:：；;]+/, "");
+  }
+
+  return { agentIds, rest };
 }
 
 function createReplyReference(message) {

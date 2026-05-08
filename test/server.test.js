@@ -413,6 +413,99 @@ test("agent replies can mention another agent and start a delegated job", async 
   }
 });
 
+test("agent replies only delegate when mentions are at the start", async () => {
+  const calls = [];
+  const server = createServer({
+    runAgent: async (agentConfig, prompt, options) => {
+      calls.push({ agentConfig, prompt, options });
+      return {
+        reply: "Please ask @ClaudeCode-1 to review this later",
+        sessionState: { sessionId: "0dd7d2dd-3886-4bb9-9c48-1a8c6f1d8e51" },
+      };
+    },
+  });
+  const port = await listen(server);
+
+  try {
+    const response = await requestJson(port, "/api/agents/codex/reply", {
+      method: "POST",
+      body: {
+        agent: {
+          id: "agent-codex-middle",
+          type: "codex",
+          name: "Codex-1",
+          label: "Codex 1",
+        },
+        room: {
+          id: "room-middle-mention",
+          name: "Middle mention room",
+        },
+        workingDir: ROOT,
+        activeRoomId: "room-middle-mention",
+        typingMessageId: "typing-codex-middle",
+        roomSnapshot: {
+          id: "room-middle-mention",
+          name: "Middle mention room",
+          workingDir: ROOT,
+          agents: [
+            {
+              id: "agent-codex-middle",
+              type: "codex",
+              name: "Codex-1",
+              label: "Codex 1",
+              replying: true,
+            },
+            {
+              id: "agent-claude-middle",
+              type: "claudecode",
+              name: "ClaudeCode-1",
+              label: "Claude Code 1",
+            },
+          ],
+          messages: [
+            { id: "user-middle", sender: "user", author: "User", text: "@Codex-1 plan" },
+            {
+              id: "typing-codex-middle",
+              sender: "agent",
+              agentId: "agent-codex-middle",
+              author: "Codex 1",
+              text: "Working",
+              typing: true,
+              replyTo: { id: "user-middle", author: "User", text: "@Codex-1 plan" },
+            },
+          ],
+        },
+        message: "@Codex-1 plan",
+        cleanMessage: "plan",
+        conversation: [{ author: "User", text: "@Codex-1 plan" }],
+      },
+    });
+
+    assert.equal(response.statusCode, 202);
+    const completed = await waitFor(async () => {
+      const state = await requestJson(port, "/api/cache/state");
+      const room = state.body.rooms.find((item) => item.id === "room-middle-mention");
+      return room?.messages.some((message) => message.text === "Please ask @ClaudeCode-1 to review this later")
+        ? room
+        : null;
+    }, 1000);
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(calls.length, 1);
+    assert.equal(
+      completed.messages.some((message) => message.agentId === "agent-claude-middle"),
+      false,
+    );
+    const jobs = await requestJson(port, "/api/jobs");
+    assert.equal(
+      jobs.body.jobs.some((job) => job.agentId === "agent-claude-middle" && job.source === "agent-mention"),
+      false,
+    );
+  } finally {
+    await close(server);
+  }
+});
+
 test("static root serves the chat page", async () => {
   const server = createServer();
   const port = await listen(server);

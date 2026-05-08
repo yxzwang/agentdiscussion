@@ -642,29 +642,37 @@ function escapeRegExp(value) {
 }
 
 function getMentionedAgents(text, room) {
-  const matches = new Set();
-
-  room.agents.forEach((agent) => {
-    const pattern = new RegExp(
-      `(^|\\s)@${escapeRegExp(agent.name)}(?=$|\\s|[,.!?，。！？:：；;])`,
-      "i",
-    );
-
-    if (pattern.test(text)) {
-      matches.add(agent.id);
-    }
-  });
-
-  return room.agents.filter((agent) => matches.has(agent.id));
+  const { agentIds } = consumeLeadingMentions(text, room);
+  return room.agents.filter((agent) => agentIds.has(agent.id));
 }
 
 function stripMentions(text, room) {
-  return room.agents
-    .reduce((value, agent) => {
-      const pattern = new RegExp(`@${escapeRegExp(agent.name)}`, "gi");
-      return value.replace(pattern, "");
-    }, text)
-    .trim();
+  return consumeLeadingMentions(text, room).rest.trim();
+}
+
+function consumeLeadingMentions(text, room) {
+  let rest = String(text || "").trimStart();
+  const agentIds = new Set();
+
+  while (rest.startsWith("@")) {
+    const match = room.agents
+      .map((agent) => {
+        const pattern = new RegExp(
+          `^@${escapeRegExp(agent.name)}(?=$|\\s|[,.!?，。！？:：；;])`,
+          "i",
+        );
+        const matched = rest.match(pattern);
+        return matched ? { agent, length: matched[0].length } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)[0];
+
+    if (!match) break;
+    agentIds.add(match.agent.id);
+    rest = rest.slice(match.length).replace(/^[\s,.!?，。！？:：；;]+/, "");
+  }
+
+  return { agentIds, rest };
 }
 
 function createReplyReference(message) {
