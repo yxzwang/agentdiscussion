@@ -294,6 +294,7 @@ async function handleCreateSchedule(request, response) {
   await ensureSchedulesLoaded();
   const payload = await readJsonBody(request);
   const intervalMs = normalizeScheduleInterval(payload.intervalMs);
+  const firstRunDelayMs = normalizeFirstRunDelay(payload.firstRunDelayMs);
   const prompt = String(payload.prompt || "").trim();
   if (!prompt) throw new HttpError(400, "Prompt is required");
 
@@ -317,7 +318,7 @@ async function handleCreateSchedule(request, response) {
     createdAt: now,
     updatedAt: now,
     lastRunAt: null,
-    nextRunAt: active ? now : null,
+    nextRunAt: active ? new Date(Date.now() + firstRunDelayMs).toISOString() : null,
     lastError: "",
   };
 
@@ -333,11 +334,29 @@ async function handleUpdateSchedule(request, response, scheduleId) {
   const schedule = SCHEDULES.find((item) => item.id === scheduleId);
   if (!schedule) throw new HttpError(404, "Schedule not found");
 
+  const hasFirstRunDelay = Object.prototype.hasOwnProperty.call(payload, "firstRunDelayMs");
+  const hasInterval = Object.prototype.hasOwnProperty.call(payload, "intervalMs");
+  const hasPrompt = Object.prototype.hasOwnProperty.call(payload, "prompt");
+  const firstRunDelayMs = hasFirstRunDelay
+    ? normalizeFirstRunDelay(payload.firstRunDelayMs)
+    : null;
+  const nextIntervalMs = hasInterval
+    ? normalizeScheduleInterval(payload.intervalMs)
+    : schedule.intervalMs;
+  const nextPrompt = hasPrompt ? String(payload.prompt || "").trim() : schedule.prompt;
+  if (!nextPrompt) throw new HttpError(400, "Prompt is required");
+
+  schedule.intervalMs = nextIntervalMs;
+  schedule.prompt = nextPrompt;
+
   if (Object.prototype.hasOwnProperty.call(payload, "active")) {
     schedule.active = Boolean(payload.active);
     schedule.nextRunAt = schedule.active
-      ? new Date(Date.now() + schedule.intervalMs).toISOString()
+      ? new Date(Date.now() + (hasFirstRunDelay ? firstRunDelayMs : schedule.intervalMs)).toISOString()
       : null;
+    schedule.lastError = "";
+  } else if (hasFirstRunDelay && schedule.active) {
+    schedule.nextRunAt = new Date(Date.now() + firstRunDelayMs).toISOString();
     schedule.lastError = "";
   }
 
@@ -1019,6 +1038,14 @@ function normalizeScheduleInterval(intervalMs) {
   const number = Number(intervalMs);
   if (!Number.isFinite(number) || number < MIN_SCHEDULE_INTERVAL_MS) {
     return MIN_SCHEDULE_INTERVAL_MS;
+  }
+  return Math.floor(number);
+}
+
+function normalizeFirstRunDelay(delayMs) {
+  const number = Number(delayMs);
+  if (!Number.isFinite(number) || number < 0) {
+    return 0;
   }
   return Math.floor(number);
 }

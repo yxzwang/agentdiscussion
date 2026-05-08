@@ -178,6 +178,20 @@
             </select>
           </div>
 
+          <label class="field-label" for="scheduleFirstRunMode">首次运行</label>
+          <div class="interval-row first-run-row">
+            <select class="field-control" id="scheduleFirstRunMode">
+              <option value="immediate" selected>立即</option>
+              <option value="delay">自定义时间后</option>
+            </select>
+            <input id="scheduleFirstRunDelay" type="number" min="1" value="5" />
+            <select class="field-control" id="scheduleFirstRunUnit">
+              <option value="1000">秒</option>
+              <option value="60000" selected>分钟</option>
+              <option value="3600000">小时</option>
+            </select>
+          </div>
+
           <label class="field-label" for="schedulePrompt">Prompt</label>
           <textarea id="schedulePrompt" rows="5" placeholder="发送给 agent 的 prompt"></textarea>
 

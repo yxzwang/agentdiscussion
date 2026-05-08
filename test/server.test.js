@@ -528,6 +528,7 @@ test("static root serves the chat page", async () => {
     assert.match(response.body, /scheduleDialog/);
     assert.match(response.body, /scheduleAgent/);
     assert.match(response.body, /schedulePrompt/);
+    assert.match(response.body, /scheduleFirstRunMode/);
     assert.match(response.body, /createSchedule/);
     assert.match(response.body, /resizeHandle/);
     assert.match(response.body, /roomPathInput/);
@@ -740,6 +741,112 @@ test("scheduled tasks can trigger prompts and be stopped or deleted", async () =
       false,
     );
   } finally {
+    await close(server);
+  }
+});
+
+test("scheduled tasks can be edited and rescheduled with a first-run delay", async () => {
+  const calls = [];
+  const server = createServer({
+    runAgent: async (_agentConfig, prompt) => {
+      calls.push(prompt);
+      return {
+        reply: prompt.includes("edited scheduled prompt") ? "edited scheduled reply" : "delayed scheduled reply",
+        sessionState: {},
+      };
+    },
+  });
+  const port = await listen(server);
+  let scheduleId;
+
+  try {
+    const saveState = await requestJson(port, "/api/cache/state", {
+      method: "POST",
+      body: {
+        activeRoomId: "room-schedule-edit",
+        rooms: [
+          {
+            id: "room-schedule-edit",
+            name: "Schedule edit room",
+            workingDir: ROOT,
+            agents: [
+              {
+                id: "agent-schedule-edit",
+                type: "codex",
+                name: "Codex-1",
+                label: "Codex 1",
+              },
+            ],
+            messages: [{ id: "sys-schedule-edit", sender: "system", text: "created" }],
+          },
+        ],
+      },
+    });
+    assert.equal(saveState.statusCode, 200);
+
+    const created = await requestJson(port, "/api/schedules", {
+      method: "POST",
+      body: {
+        roomId: "room-schedule-edit",
+        agentId: "agent-schedule-edit",
+        intervalMs: 1000,
+        firstRunDelayMs: 300,
+        prompt: "delayed scheduled prompt",
+      },
+    });
+    scheduleId = created.body.schedule.id;
+    assert.equal(created.statusCode, 201);
+    assert.equal(created.body.schedule.intervalMs, 1000);
+    assert.equal(created.body.schedule.prompt, "delayed scheduled prompt");
+    assert.ok(new Date(created.body.schedule.nextRunAt).getTime() - Date.now() > 100);
+
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(calls.length, 0);
+
+    await waitFor(async () => {
+      const state = await requestJson(port, "/api/cache/state");
+      const room = state.body.rooms.find((item) => item.id === "room-schedule-edit");
+      return room?.messages.some((message) => message.text === "delayed scheduled reply") ? room : null;
+    }, 1000);
+    assert.equal(calls.length, 1);
+
+    const updated = await requestJson(port, `/api/schedules/${scheduleId}`, {
+      method: "PATCH",
+      body: {
+        intervalMs: 500,
+        firstRunDelayMs: 250,
+        prompt: "edited scheduled prompt",
+        active: true,
+      },
+    });
+    assert.equal(updated.statusCode, 200);
+    assert.equal(updated.body.schedule.intervalMs, 500);
+    assert.equal(updated.body.schedule.prompt, "edited scheduled prompt");
+    assert.equal(updated.body.schedule.active, true);
+    assert.ok(new Date(updated.body.schedule.nextRunAt).getTime() - Date.now() > 100);
+
+    await waitFor(async () => {
+      const state = await requestJson(port, "/api/cache/state");
+      const room = state.body.rooms.find((item) => item.id === "room-schedule-edit");
+      return room?.messages.some((message) => message.text === "edited scheduled reply") ? room : null;
+    }, 1000);
+    assert.ok(calls.some((prompt) => /edited scheduled prompt/.test(prompt)));
+
+    const stopped = await requestJson(port, `/api/schedules/${scheduleId}`, {
+      method: "PATCH",
+      body: { active: false },
+    });
+    assert.equal(stopped.statusCode, 200);
+
+    const deleted = await requestJson(port, `/api/schedules/${scheduleId}`, {
+      method: "DELETE",
+    });
+    assert.equal(deleted.statusCode, 200);
+    scheduleId = null;
+  } finally {
+    if (scheduleId) {
+      await requestJson(port, `/api/schedules/${scheduleId}`, { method: "DELETE" }).catch(() => {});
+    }
     await close(server);
   }
 });

@@ -228,8 +228,22 @@ button {
   gap: 8px;
 }
 
+.first-run-row {
+  grid-template-columns: minmax(0, 1fr) 96px 96px;
+}
+
 .interval-row input {
   height: 36px;
+}
+
+.interval-row input:disabled,
+.interval-row select:disabled,
+.field-control:disabled {
+  border-color: var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 0.62;
 }
 
 .dialog-actions {

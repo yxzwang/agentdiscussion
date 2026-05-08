@@ -29,6 +29,10 @@ const state = {
   agentTimeoutMs: FALLBACK_AGENT_TIMEOUT_MS,
   saveTimer: null,
   pollTimer: null,
+  scheduleDialog: {
+    mode: "create",
+    scheduleId: null,
+  },
   cacheDialog: {
     sourceRoomId: null,
     rooms: [],
@@ -54,9 +58,13 @@ const elements = {
   createSchedule: document.querySelector("#createSchedule"),
   scheduleList: document.querySelector("#scheduleList"),
   scheduleDialog: document.querySelector("#scheduleDialog"),
+  scheduleDialogTitle: document.querySelector("#scheduleDialogTitle"),
   scheduleAgent: document.querySelector("#scheduleAgent"),
   scheduleInterval: document.querySelector("#scheduleInterval"),
   scheduleIntervalUnit: document.querySelector("#scheduleIntervalUnit"),
+  scheduleFirstRunMode: document.querySelector("#scheduleFirstRunMode"),
+  scheduleFirstRunDelay: document.querySelector("#scheduleFirstRunDelay"),
+  scheduleFirstRunUnit: document.querySelector("#scheduleFirstRunUnit"),
   schedulePrompt: document.querySelector("#schedulePrompt"),
   scheduleStatus: document.querySelector("#scheduleStatus"),
   saveSchedule: document.querySelector("#saveSchedule"),
@@ -295,52 +303,146 @@ function closePathDialog() {
   setPathDialogStatus("");
 }
 
-function getScheduleDraft() {
-  const draft = readStorageJson(SCHEDULE_DRAFT_KEY, {});
-  return draft && typeof draft === "object" ? draft : {};
+function getScheduleDraftKey(mode = state.scheduleDialog.mode, scheduleId = state.scheduleDialog.scheduleId) {
+  return mode === "edit" && scheduleId ? `edit:${scheduleId}` : "create";
+}
+
+function getScheduleDraft(key = getScheduleDraftKey()) {
+  if (state.scheduleDialog.mode === "copy") return {};
+  const drafts = readStorageJson(SCHEDULE_DRAFT_KEY, {});
+  if (!drafts || typeof drafts !== "object") return {};
+  if (drafts[key] && typeof drafts[key] === "object") return drafts[key];
+  return key === "create" ? drafts : {};
 }
 
 function persistScheduleDraft() {
-  writeStorageJson(SCHEDULE_DRAFT_KEY, {
+  const drafts = readStorageJson(SCHEDULE_DRAFT_KEY, {});
+  const key = getScheduleDraftKey();
+  drafts[key] = {
     agentValue: elements.scheduleAgent.value,
     interval: elements.scheduleInterval.value,
     intervalUnit: elements.scheduleIntervalUnit.value,
+    firstRunMode: elements.scheduleFirstRunMode.value,
+    firstRunDelay: elements.scheduleFirstRunDelay.value,
+    firstRunUnit: elements.scheduleFirstRunUnit.value,
     prompt: elements.schedulePrompt.value,
-  });
+  };
+  writeStorageJson(SCHEDULE_DRAFT_KEY, drafts);
 }
 
-function restoreScheduleDraft(options) {
+function clearScheduleDraft(key = getScheduleDraftKey()) {
+  const drafts = readStorageJson(SCHEDULE_DRAFT_KEY, {});
+  if (!drafts || typeof drafts !== "object") return;
+  delete drafts[key];
+  writeStorageJson(SCHEDULE_DRAFT_KEY, drafts);
+}
+
+function restoreScheduleDraft(options, fallback = {}) {
   const draft = getScheduleDraft();
   const optionValues = new Set(options.map((option) => option.value));
-  const interval = Number(draft.interval);
-  const intervalUnit = String(draft.intervalUnit || "60000");
+  const interval = Number(draft.interval ?? fallback.interval ?? 5);
+  const intervalUnit = String(draft.intervalUnit || fallback.intervalUnit || "60000");
+  const agentValue = draft.agentValue || fallback.agentValue || "";
+  const firstRunMode = draft.firstRunMode || fallback.firstRunMode || "immediate";
+  const firstRunDelay = Number(draft.firstRunDelay ?? fallback.firstRunDelay ?? 5);
+  const firstRunUnit = String(draft.firstRunUnit || fallback.firstRunUnit || "60000");
 
-  if (draft.agentValue && optionValues.has(draft.agentValue)) {
-    elements.scheduleAgent.value = draft.agentValue;
+  if (agentValue && optionValues.has(agentValue)) {
+    elements.scheduleAgent.value = agentValue;
   } else if (options[0]) {
     elements.scheduleAgent.value = options[0].value;
   }
 
   elements.scheduleInterval.value = Number.isFinite(interval) && interval > 0
-    ? String(draft.interval)
+    ? String(draft.interval ?? fallback.interval ?? 5)
     : "5";
   elements.scheduleIntervalUnit.value = [...elements.scheduleIntervalUnit.options].some(
     (option) => option.value === intervalUnit,
   )
     ? intervalUnit
     : "60000";
-  elements.schedulePrompt.value = String(draft.prompt || "");
+  elements.scheduleFirstRunMode.value = firstRunMode === "delay" ? "delay" : "immediate";
+  elements.scheduleFirstRunDelay.value = Number.isFinite(firstRunDelay) && firstRunDelay > 0
+    ? String(draft.firstRunDelay ?? fallback.firstRunDelay ?? 5)
+    : "5";
+  elements.scheduleFirstRunUnit.value = [...elements.scheduleFirstRunUnit.options].some(
+    (option) => option.value === firstRunUnit,
+  )
+    ? firstRunUnit
+    : "60000";
+  elements.schedulePrompt.value = String(draft.prompt ?? fallback.prompt ?? "");
+  syncScheduleFirstRunControls();
 }
 
-function openScheduleDialog() {
+function splitDurationForForm(ms) {
+  const value = Math.max(1, Math.round(Number(ms) || 1));
+  if (value % 3600000 === 0) return { value: value / 3600000, unit: "3600000" };
+  if (value % 60000 === 0) return { value: value / 60000, unit: "60000" };
+  if (value % 1000 === 0) return { value: value / 1000, unit: "1000" };
+  return { value: Math.ceil(value / 1000), unit: "1000" };
+}
+
+function syncScheduleFirstRunControls() {
+  const customDelay = elements.scheduleFirstRunMode.value === "delay";
+  elements.scheduleFirstRunDelay.disabled = !customDelay;
+  elements.scheduleFirstRunUnit.disabled = !customDelay;
+}
+
+function getFirstRunDelayMs() {
+  if (elements.scheduleFirstRunMode.value !== "delay") return 0;
+  const value = Number(elements.scheduleFirstRunDelay.value);
+  const unit = Number(elements.scheduleFirstRunUnit.value);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error("首次运行时间必须大于 0");
+  }
+  return Math.round(value * unit);
+}
+
+function openScheduleDialog(scheduleId = null, mode = "create") {
+  const sourceSchedule = scheduleId
+    ? state.schedules.find((schedule) => schedule.id === scheduleId)
+    : null;
+  const editingSchedule = mode === "edit" ? sourceSchedule : null;
+  const copyingSchedule = mode === "copy" ? sourceSchedule : null;
   const options = getScheduleAgentOptions();
+  state.scheduleDialog = {
+    mode: editingSchedule ? "edit" : copyingSchedule ? "copy" : "create",
+    scheduleId: editingSchedule?.id || null,
+  };
   elements.scheduleAgent.innerHTML = options
     .map(
       (option) =>
         `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`,
     )
     .join("");
-  restoreScheduleDraft(options);
+  elements.scheduleDialogTitle.textContent = editingSchedule
+    ? "编辑定时任务"
+    : copyingSchedule
+      ? "复制定时任务"
+      : "新建定时任务";
+  elements.saveSchedule.textContent = editingSchedule ? "保存修改" : "确认创建";
+  elements.scheduleAgent.disabled = Boolean(editingSchedule);
+
+  if (editingSchedule || copyingSchedule) {
+    const source = editingSchedule || copyingSchedule;
+    const interval = splitDurationForForm(source.intervalMs);
+    const nextDelayMs = source.active && source.nextRunAt
+      ? Math.max(0, source.nextRunAt.getTime() - Date.now())
+      : 0;
+    const firstRun = nextDelayMs > 0 ? splitDurationForForm(nextDelayMs) : null;
+    restoreScheduleDraft(options, {
+      agentValue: `${source.roomId}::${source.agentId}`,
+      interval: interval.value,
+      intervalUnit: interval.unit,
+      firstRunMode: firstRun ? "delay" : "immediate",
+      firstRunDelay: firstRun?.value || 5,
+      firstRunUnit: firstRun?.unit || "60000",
+      prompt: source.prompt,
+    });
+  } else {
+    restoreScheduleDraft(options);
+  }
+
   setScheduleStatus(options.length === 0 ? "先创建讨论组和 agent" : "");
   elements.saveSchedule.disabled = options.length === 0;
   elements.scheduleDialog.hidden = false;
@@ -366,6 +468,7 @@ async function saveSchedule() {
   const intervalValue = Number(elements.scheduleInterval.value);
   const unit = Number(elements.scheduleIntervalUnit.value);
   const prompt = elements.schedulePrompt.value.trim();
+  let firstRunDelayMs;
   persistScheduleDraft();
 
   if (!roomId || !agentId) {
@@ -380,20 +483,41 @@ async function saveSchedule() {
     setScheduleStatus("请输入 prompt", true);
     return;
   }
+  try {
+    firstRunDelayMs = getFirstRunDelayMs();
+  } catch (error) {
+    setScheduleStatus(error.message, true);
+    return;
+  }
 
   try {
-    setScheduleStatus("创建中");
-    await createSchedule({
-      roomId,
-      agentId,
-      intervalMs: Math.round(intervalValue * unit),
-      prompt,
-      active: true,
-    });
+    const intervalMs = Math.round(intervalValue * unit);
+    const isEdit = state.scheduleDialog.mode === "edit" && state.scheduleDialog.scheduleId;
+    setScheduleStatus(isEdit ? "保存中" : "创建中");
+
+    if (isEdit) {
+      await updateSchedule(state.scheduleDialog.scheduleId, {
+        intervalMs,
+        prompt,
+        firstRunDelayMs,
+        active: true,
+      });
+      clearScheduleDraft();
+    } else {
+      await createSchedule({
+        roomId,
+        agentId,
+        intervalMs,
+        prompt,
+        firstRunDelayMs,
+        active: true,
+      });
+    }
+
     await loadSchedules();
     closeScheduleDialog();
   } catch (error) {
-    setScheduleStatus(error.message || "创建失败", true);
+    setScheduleStatus(error.message || "保存失败", true);
   }
 }
 
@@ -1567,6 +1691,8 @@ function renderSchedules() {
               : ""
           }
           <div class="schedule-actions">
+            <button class="secondary-action" type="button" data-action="edit-schedule" data-schedule-id="${escapeHtml(schedule.id)}">编辑</button>
+            <button class="secondary-action" type="button" data-action="copy-schedule" data-schedule-id="${escapeHtml(schedule.id)}">复制</button>
             <button class="secondary-action" type="button" data-action="toggle-schedule" data-schedule-id="${escapeHtml(schedule.id)}" data-active="${schedule.active ? "false" : "true"}">${schedule.active ? "停止" : "开始"}</button>
             <button class="room-command close" type="button" data-action="delete-schedule" data-schedule-id="${escapeHtml(schedule.id)}" aria-label="删除定时任务">×</button>
           </div>
@@ -1714,11 +1840,17 @@ function keepDialogOpenOnBackdropClick(event) {
 
 elements.addAgent.addEventListener("click", () => addAgent());
 elements.createRoom.addEventListener("click", createRoomFromForm);
-elements.createSchedule.addEventListener("click", openScheduleDialog);
+elements.createSchedule.addEventListener("click", () => openScheduleDialog());
 elements.saveSchedule.addEventListener("click", saveSchedule);
 elements.scheduleAgent.addEventListener("change", persistScheduleDraft);
 elements.scheduleInterval.addEventListener("input", persistScheduleDraft);
 elements.scheduleIntervalUnit.addEventListener("change", persistScheduleDraft);
+elements.scheduleFirstRunMode.addEventListener("change", () => {
+  syncScheduleFirstRunControls();
+  persistScheduleDraft();
+});
+elements.scheduleFirstRunDelay.addEventListener("input", persistScheduleDraft);
+elements.scheduleFirstRunUnit.addEventListener("change", persistScheduleDraft);
 elements.schedulePrompt.addEventListener("input", persistScheduleDraft);
 elements.saveRoomSettings.addEventListener("click", saveActiveRoomSettings);
 elements.selectNewRoomPath.addEventListener("click", () => openPathDialog("new-room"));
@@ -1774,6 +1906,14 @@ document.addEventListener("click", (event) => {
     })
       .then(loadSchedules)
       .catch((error) => setScheduleStatus(error.message || "更新失败", true));
+  }
+
+  if (target.dataset.action === "edit-schedule") {
+    openScheduleDialog(target.dataset.scheduleId, "edit");
+  }
+
+  if (target.dataset.action === "copy-schedule") {
+    openScheduleDialog(target.dataset.scheduleId, "copy");
   }
 
   if (target.dataset.action === "delete-schedule") {
