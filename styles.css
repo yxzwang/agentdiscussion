@@ -712,7 +712,7 @@ h2 {
 
 .agent-builder {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
   gap: 10px;
   padding: 14px;
   border-bottom: 1px solid var(--line);

@@ -429,6 +429,7 @@ async function handleAgentReply(request, response, type, context) {
   const typingMessageId = String(payload.typingMessageId || "");
   const latestAgent = roomSnapshot.agents.find((agent) => agent.id === agentId);
   if (latestAgent) latestAgent.replying = true;
+  const promptAgent = latestAgent || payload.agent || {};
 
   const jobId = createServerId("job");
   const typingMessage = roomSnapshot.messages.find((message) => message.id === typingMessageId);
@@ -452,12 +453,16 @@ async function handleAgentReply(request, response, type, context) {
 
   const prompt = buildPrompt({
     type,
-    agent: payload.agent || {},
+    agent: promptAgent,
     room: roomSnapshot,
     workingDir,
     message,
     cleanMessage: String(payload.cleanMessage || ""),
-    conversation: Array.isArray(payload.conversation) ? payload.conversation : [],
+    conversation: buildPromptConversation(
+      roomSnapshot,
+      promptAgent,
+      Array.isArray(payload.conversation) ? payload.conversation : [],
+    ),
   });
 
   runBackgroundAgentJob({
@@ -562,6 +567,26 @@ function buildPrompt({ type, agent, room, workingDir, message, cleanMessage, con
   const agentDirectory = Array.isArray(room?.agents)
     ? room.agents.map((item) => `@${item.name}`).join(", ")
     : "";
+
+  if (isDirectContextAgent(agent)) {
+    return [
+      role,
+      `你的名称是 ${agent.label || agent.name || "Agent"}。`,
+      `本次运行目录是 ${workingDir || ROOT}。`,
+      "你正在与用户进行一对一对话。你只能看到用户直接发给你的消息和你自己的历史回复。",
+      "请只回复当前用户直接发给你的消息，不要引用未出现在当前对话记录里的内容。",
+      "回复要适合直接显示给用户，简洁、具体、中文优先。",
+      "",
+      "最近对话记录：",
+      transcript || "(暂无)",
+      "",
+      "当前用户消息：",
+      message,
+      "",
+      "去掉 @ 后的用户请求：",
+      cleanMessage || message,
+    ].filter(Boolean).join("\n");
+  }
 
   return [
     role,
@@ -864,6 +889,7 @@ async function queueMentionedAgentJobs({
 }) {
   const targets = getMentionedAgents(sourceMessage.text, room)
     .filter((agent) => agent.id !== sourceAgentId)
+    .filter((agent) => !isDirectContextAgent(agent) || sourceMessage.sender === "user")
     .filter((agent) => !agent.replying);
 
   for (const target of targets) {
@@ -926,7 +952,7 @@ async function startMentionedAgentJob({ room, sourceMessage, target, activeRoomI
     workingDir: room.workingDir,
     message: sourceMessage.text,
     cleanMessage: stripMentions(sourceMessage.text, room),
-    conversation: buildConversationSnapshot(room),
+    conversation: buildConversationSnapshot(room, target),
   });
 
   runBackgroundAgentJob({
@@ -984,14 +1010,33 @@ function createReplyReference(message) {
   });
 }
 
-function buildConversationSnapshot(room) {
+function buildPromptConversation(room, agent, providedConversation) {
+  if (isDirectContextAgent(agent)) {
+    return buildConversationSnapshot(room, agent);
+  }
+  return Array.isArray(providedConversation) ? providedConversation : buildConversationSnapshot(room);
+}
+
+function buildConversationSnapshot(room, agent = null) {
   return room.messages
     .filter((message) => !message.typing)
+    .filter((message) => !isDirectContextAgent(agent) || isDirectConversationMessage(message, agent, room))
     .map((message) => ({
       sender: message.sender,
       author: message.author || (message.sender === "user" ? "你" : "系统"),
       text: message.text,
     }));
+}
+
+function isDirectConversationMessage(message, agent, room) {
+  if (message.sender === "user") {
+    return getMentionedAgents(message.text || "", room).some((mentioned) => mentioned.id === agent.id);
+  }
+  return message.sender === "agent" && message.agentId === agent.id;
+}
+
+function isDirectContextAgent(agent) {
+  return agent?.contextMode === "direct";
 }
 
 async function ensureSchedulesLoaded() {
@@ -1149,7 +1194,7 @@ async function dispatchScheduledPrompt(schedule) {
       workingDir: room.workingDir,
       message: sourceMessage.text,
       cleanMessage: schedule.prompt,
-      conversation: buildConversationSnapshot(room),
+      conversation: buildConversationSnapshot(room, agent),
     }),
     context: schedulerContext,
     workingDir: room.workingDir,
@@ -1271,6 +1316,7 @@ function sanitizeAgents(agents) {
         initials: String(agent.initials || (agent.type === "claudecode" ? "CC" : "CX")),
         muted: agent.muted !== false,
         replying: Boolean(agent.replying),
+        contextMode: agent.contextMode === "direct" ? "direct" : "group",
         sessionState: sanitizeSessionState(agent.sessionState),
       }))
     : [];

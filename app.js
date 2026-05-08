@@ -133,6 +133,16 @@ function getSelectedAgentType() {
   return document.querySelector("input[name='agentType']:checked").value;
 }
 
+function getSelectedAgentContextMode() {
+  return document.querySelector("input[name='agentContextMode']:checked")?.value === "direct"
+    ? "direct"
+    : "group";
+}
+
+function isDirectContextAgent(agent) {
+  return agent?.contextMode === "direct";
+}
+
 function createRoom({ name, workingDir }) {
   const now = new Date();
   return {
@@ -635,7 +645,7 @@ async function saveActiveRoomSettings() {
   }
 }
 
-function createAgent(type, room) {
+function createAgent(type, room, contextMode = "group") {
   const config = agentTypes[type];
   const number = room.counters[type]++;
   const handleBase = type === "claudecode" ? "ClaudeCode" : config.label;
@@ -649,6 +659,7 @@ function createAgent(type, room) {
     initials: config.initials,
     muted: true,
     replying: false,
+    contextMode: contextMode === "direct" ? "direct" : "group",
     sessionState: {},
   };
 }
@@ -657,19 +668,19 @@ function addAgent(type = getSelectedAgentType()) {
   const room = getActiveRoom();
   if (!room) return;
 
-  const agent = addAgentToRoom(room, type, false);
+  const agent = addAgentToRoom(room, type, false, getSelectedAgentContextMode());
   room.messages.push({
     id: createId("system"),
     sender: "system",
-    text: `${agent.label} 已进入讨论组`,
+    text: `${agent.label} 已进入讨论组${isDirectContextAgent(agent) ? "（独立上下文）" : ""}`,
     createdAt: new Date(),
   });
   render();
   persistOpenStateDebounced();
 }
 
-function addAgentToRoom(room, type, quiet) {
-  const agent = createAgent(type, room);
+function addAgentToRoom(room, type, quiet, contextMode = "group") {
+  const agent = createAgent(type, room, contextMode);
   room.agents.push(agent);
   if (!quiet) render();
   return agent;
@@ -920,6 +931,7 @@ async function submitAgentJob(room, agent, sourceText, typingMessageId) {
           type: agent.type,
           name: agent.name,
           label: agent.label,
+          contextMode: agent.contextMode || "group",
         },
         room: {
           id: room.id,
@@ -932,7 +944,7 @@ async function submitAgentJob(room, agent, sourceText, typingMessageId) {
         typingMessageId,
         message: sourceText,
         cleanMessage: stripMentions(sourceText, room),
-        conversation: buildConversationSnapshot(room),
+        conversation: buildConversationSnapshot(room, agent),
       }),
     });
   } catch (error) {
@@ -1158,14 +1170,22 @@ async function loadBackendConfig() {
   }
 }
 
-function buildConversationSnapshot(room) {
+function buildConversationSnapshot(room, agent = null) {
   return room.messages
     .filter((message) => !message.typing)
+    .filter((message) => !isDirectContextAgent(agent) || isDirectConversationMessage(message, agent, room))
     .map((message) => ({
       sender: message.sender,
       author: message.author || (message.sender === "user" ? "你" : "系统"),
       text: message.text,
     }));
+}
+
+function isDirectConversationMessage(message, agent, room) {
+  if (message.sender === "user") {
+    return getMentionedAgents(message.text || "", room).some((mentioned) => mentioned.id === agent.id);
+  }
+  return message.sender === "agent" && message.agentId === agent.id;
 }
 
 function mergeRoomFromServer(serverRoom) {
@@ -1272,6 +1292,7 @@ function reviveAgent(agent) {
     initials: agent.initials || config.initials,
     muted: agent.muted !== false,
     replying: Boolean(agent.replying),
+    contextMode: agent.contextMode === "direct" ? "direct" : "group",
     sessionState: agent.sessionState || {},
   };
 }
@@ -1635,15 +1656,16 @@ function renderAgents() {
   elements.agentList.innerHTML = agents
     .map((agent) => {
       const config = agentTypes[agent.type];
+      const modeLabel = isDirectContextAgent(agent) ? "独立" : config.label;
       return `
         <article class="agent-card">
           <div class="agent-avatar ${agent.type}">${config.initials}</div>
           <div class="agent-meta">
             <div class="agent-name-row">
               <input class="agent-name-input" type="text" value="${escapeHtml(agent.label)}" data-action="rename-agent" data-agent-id="${agent.id}" aria-label="Agent 名称" />
-              <span class="agent-badge">${agent.replying ? "回复中" : config.label}</span>
+              <span class="agent-badge">${agent.replying ? "回复中" : modeLabel}</span>
             </div>
-            <span class="agent-handle">@${escapeHtml(agent.name)}</span>
+            <span class="agent-handle">@${escapeHtml(agent.name)}${isDirectContextAgent(agent) ? " · 独立上下文" : ""}</span>
           </div>
           <div class="agent-actions">
             <button class="agent-command" type="button" data-action="mention" data-agent-id="${agent.id}" title="@${escapeHtml(agent.name)}" aria-label="@${escapeHtml(agent.name)}">@</button>

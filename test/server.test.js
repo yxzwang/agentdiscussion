@@ -191,6 +191,160 @@ test("reply endpoint starts a background job and persists the final reply", asyn
   }
 });
 
+test("direct-context agents only receive their own user-addressed context", async () => {
+  const calls = [];
+  const server = createServer({
+    runAgent: async (agentConfig, prompt, options) => {
+      calls.push({ agentConfig, prompt, options });
+      return {
+        reply: agentConfig.label === "Codex" ? "direct reply visible to group" : "normal agent saw group",
+        sessionState: {},
+      };
+    },
+  });
+  const port = await listen(server);
+
+  try {
+    const directResponse = await requestJson(port, "/api/agents/codex/reply", {
+      method: "POST",
+      body: {
+        agent: {
+          id: "agent-direct-codex",
+          type: "codex",
+          name: "Codex-1",
+          label: "Codex 1",
+        },
+        room: {
+          id: "room-direct-context",
+          name: "Secret Group Room",
+        },
+        workingDir: ROOT,
+        activeRoomId: "room-direct-context",
+        typingMessageId: "typing-direct-codex",
+        roomSnapshot: {
+          id: "room-direct-context",
+          name: "Secret Group Room",
+          workingDir: ROOT,
+          agents: [
+            {
+              id: "agent-direct-codex",
+              type: "codex",
+              name: "Codex-1",
+              label: "Codex 1",
+              contextMode: "direct",
+              replying: true,
+            },
+            {
+              id: "agent-normal-claude",
+              type: "claudecode",
+              name: "ClaudeCode-1",
+              label: "Claude Code 1",
+            },
+          ],
+          messages: [
+            { id: "system-direct", sender: "system", author: "System", text: "room created" },
+            { id: "other-user", sender: "user", author: "User", text: "@ClaudeCode-1 other user secret" },
+            {
+              id: "other-agent",
+              sender: "agent",
+              agentId: "agent-normal-claude",
+              author: "Claude Code 1",
+              text: "other agent secret",
+            },
+            { id: "old-direct-user", sender: "user", author: "User", text: "@Codex-1 old direct user" },
+            {
+              id: "old-direct-reply",
+              sender: "agent",
+              agentId: "agent-direct-codex",
+              author: "Codex 1",
+              text: "old direct reply",
+            },
+            { id: "new-direct-user", sender: "user", author: "User", text: "@Codex-1 new direct request" },
+            {
+              id: "typing-direct-codex",
+              sender: "agent",
+              agentId: "agent-direct-codex",
+              author: "Codex 1",
+              text: "Working",
+              typing: true,
+              replyTo: { id: "new-direct-user", author: "User", text: "@Codex-1 new direct request" },
+            },
+          ],
+        },
+        message: "@Codex-1 new direct request",
+        cleanMessage: "new direct request",
+        conversation: [{ author: "User", text: "CLIENT LEAK: full group transcript" }],
+      },
+    });
+
+    assert.equal(directResponse.statusCode, 202);
+    await waitFor(() => calls.length >= 1, 1000);
+    assert.equal(calls[0].agentConfig.label, "Codex");
+    assert.match(calls[0].prompt, /old direct user/);
+    assert.match(calls[0].prompt, /old direct reply/);
+    assert.match(calls[0].prompt, /new direct request/);
+    assert.doesNotMatch(calls[0].prompt, /Secret Group Room/);
+    assert.doesNotMatch(calls[0].prompt, /other user secret/);
+    assert.doesNotMatch(calls[0].prompt, /other agent secret/);
+    assert.doesNotMatch(calls[0].prompt, /CLIENT LEAK/);
+
+    const directCompleted = await waitFor(async () => {
+      const state = await requestJson(port, "/api/cache/state");
+      const room = state.body.rooms.find((item) => item.id === "room-direct-context");
+      return room?.messages.some((message) => message.text === "direct reply visible to group") ? room : null;
+    }, 1000);
+    assert.ok(directCompleted.messages.some((message) => message.text === "direct reply visible to group"));
+
+    const normalRoomSnapshot = {
+      ...directCompleted,
+      messages: [
+        ...directCompleted.messages,
+        { id: "normal-user", sender: "user", author: "User", text: "@ClaudeCode-1 summarize" },
+        {
+          id: "typing-normal-claude",
+          sender: "agent",
+          agentId: "agent-normal-claude",
+          author: "Claude Code 1",
+          text: "Working",
+          typing: true,
+          replyTo: { id: "normal-user", author: "User", text: "@ClaudeCode-1 summarize" },
+        },
+      ],
+    };
+    const normalResponse = await requestJson(port, "/api/agents/claudecode/reply", {
+      method: "POST",
+      body: {
+        agent: {
+          id: "agent-normal-claude",
+          type: "claudecode",
+          name: "ClaudeCode-1",
+          label: "Claude Code 1",
+        },
+        room: {
+          id: "room-direct-context",
+          name: "Secret Group Room",
+        },
+        workingDir: ROOT,
+        activeRoomId: "room-direct-context",
+        typingMessageId: "typing-normal-claude",
+        roomSnapshot: normalRoomSnapshot,
+        message: "@ClaudeCode-1 summarize",
+        cleanMessage: "summarize",
+        conversation: normalRoomSnapshot.messages
+          .filter((message) => !message.typing)
+          .map((message) => ({ author: message.author, text: message.text })),
+      },
+    });
+
+    assert.equal(normalResponse.statusCode, 202);
+    await waitFor(() => calls.length >= 2, 1000);
+    assert.equal(calls[1].agentConfig.label, "Claude Code");
+    assert.match(calls[1].prompt, /direct reply visible to group/);
+  } finally {
+    await close(server);
+  }
+});
+
 test("agent timeout restarts without session and keeps the job going", async () => {
   const calls = [];
   const server = createServer({
@@ -532,6 +686,7 @@ test("static root serves the chat page", async () => {
     assert.match(response.body, /createSchedule/);
     assert.match(response.body, /resizeHandle/);
     assert.match(response.body, /roomPathInput/);
+    assert.match(response.body, /agentContextMode/);
     assert.match(response.body, /app\.js/);
   } finally {
     await close(server);

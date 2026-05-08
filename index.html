@@ -44,6 +44,16 @@
               <span>Claude Code</span>
             </label>
           </div>
+          <div class="segmented" role="radiogroup" aria-label="上下文模式">
+            <label class="segment">
+              <input type="radio" name="agentContextMode" value="group" checked />
+              <span>群聊</span>
+            </label>
+            <label class="segment">
+              <input type="radio" name="agentContextMode" value="direct" />
+              <span>独立</span>
+            </label>
+          </div>
           <button class="primary-action" id="addAgent" type="button">
             <span aria-hidden="true">+</span>
             <span>创建</span>
