@@ -24,6 +24,7 @@ const {
   getPathCacheFile,
   readPathCache,
   resolveWorkingDirectory,
+  runProcess,
 } = require("../server");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -468,18 +469,12 @@ test("direct-context agents only receive their own user-addressed context", asyn
   }
 });
 
-test("agent timeout restarts without session and keeps the job going", async () => {
+test("agent timeout is not retried as a restarted session", async () => {
   const calls = [];
   const server = createServer({
     runAgent: async (agentConfig, prompt, options) => {
       calls.push({ agentConfig, prompt, options });
-      if (calls.length === 1) {
-        throw new Error("codex.cmd timed out after 300000ms");
-      }
-      return {
-        reply: "retry reply",
-        sessionState: { sessionId: "9e359067-f04a-4465-adcd-060d4e6c275a" },
-      };
+      throw new Error("codex.cmd timed out after 300000ms");
     },
   });
   const port = await listen(server);
@@ -544,22 +539,64 @@ test("agent timeout restarts without session and keeps the job going", async () 
     const completed = await waitFor(async () => {
       const state = await requestJson(port, "/api/cache/state");
       const room = state.body.rooms.find((item) => item.id === "room-retry");
-      return room?.messages.some((message) => message.text === "retry reply") ? room : null;
+      return room?.messages.some((message) => /timed out after 300000ms/.test(message.text))
+        ? room
+        : null;
     }, 1000);
 
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].options.sessionState, {
       sessionId: "684731bb-692a-4419-962d-bcae787e6c47",
     });
-    assert.deepEqual(calls[1].options.sessionState, {});
-    assert.equal(calls[1].options.restarted, true);
-    const reply = completed.messages.find((message) => message.text === "retry reply");
+    assert.equal(calls[0].options.restarted, false);
+    assert.equal(typeof calls[0].options.isJobActive, "function");
+    const reply = completed.messages.find((message) => /timed out after 300000ms/.test(message.text));
     assert.equal(reply.id, "typing-retry");
     assert.equal(reply.replyTo.id, "user-retry");
-    assert.equal(completed.messages.some((message) => /调用失败|timed out/.test(message.text)), false);
   } finally {
     await close(server);
   }
+});
+
+test("runProcess keeps waiting past timeout checks while the job is active", async () => {
+  let checks = 0;
+  const result = await runProcess(
+    process.execPath,
+    ["-e", "setTimeout(() => console.log('done'), 120)"],
+    "",
+    {
+      timeoutMs: 30,
+      isJobActive: () => {
+        checks += 1;
+        return true;
+      },
+    },
+  );
+
+  assert.match(result.stdout, /done/);
+  assert.ok(checks >= 2);
+});
+
+test("runProcess reports timeout when the job is no longer active", async () => {
+  let checks = 0;
+  await assert.rejects(
+    () =>
+      runProcess(
+        process.execPath,
+        ["-e", "setTimeout(() => console.log('late'), 1000)"],
+        "",
+        {
+          timeoutMs: 30,
+          isJobActive: () => {
+            checks += 1;
+            return false;
+          },
+        },
+      ),
+    /timed out after 30ms/,
+  );
+
+  assert.equal(checks, 1);
 });
 
 test("agent replies can mention another agent and start a delegated job", async () => {

@@ -602,6 +602,7 @@ async function runBackgroundAgentJob({
       context,
       workingDir,
       sessionState,
+      job,
     });
     const { reply, sessionState: nextSessionState } = normalizeAgentResult(result);
     job.status = "completed";
@@ -634,6 +635,7 @@ async function runAgentWithRestartRetry({
   context,
   workingDir,
   sessionState,
+  job,
 }) {
   let lastError;
 
@@ -644,6 +646,7 @@ async function runAgentWithRestartRetry({
         sessionState: attempt === 0 ? sessionState : {},
         restarted: attempt > 0,
         attempt: attempt + 1,
+        isJobActive: job ? createJobActiveChecker(job) : undefined,
       });
       return result;
     } catch (error) {
@@ -659,7 +662,18 @@ async function runAgentWithRestartRetry({
 
 function isRetryableAgentError(error) {
   const message = String(error?.message || error || "");
-  return /timed out after|exited with code|returned an empty response|Failed to start/i.test(message);
+  return /exited with code|returned an empty response|Failed to start/i.test(message);
+}
+
+function createJobActiveChecker(job) {
+  return () => {
+    const activeJob = BACKGROUND_JOBS.get(job.id);
+    const isActive = activeJob === job && job.status === "running";
+    if (isActive) {
+      job.updatedAt = new Date().toISOString();
+    }
+    return isActive;
+  };
 }
 
 function buildPrompt({ type, agent, room, workingDir, message, cleanMessage, conversation }) {
@@ -731,6 +745,7 @@ async function runAgent(agentConfig, prompt, options = {}) {
     const result = await runProcess(agentConfig.command, commandSetup.args, prompt, {
       signal: options.signal,
       cwd: workingDir,
+      isJobActive: options.isJobActive,
       ...(commandSetup.spawnOptions || {}),
     });
     const agentResult = await agentConfig.readResult({ ...result, ...commandSetup });
@@ -756,6 +771,7 @@ function runProcess(command, args, stdinText, options = {}) {
       return;
     }
 
+    const timeoutMs = readPositiveInteger(options.timeoutMs, AGENT_TIMEOUT_MS);
     const spawnOptions = {
       cwd: options.cwd || ROOT,
       env: options.env || process.env,
@@ -772,9 +788,10 @@ function runProcess(command, args, stdinText, options = {}) {
     let settled = false;
     let processError = null;
     let killTimer = null;
+    let timeoutTimer = null;
 
     const cleanup = () => {
-      clearTimeout(timer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       options.signal?.removeEventListener("abort", onAbort);
     };
@@ -800,10 +817,27 @@ function runProcess(command, args, stdinText, options = {}) {
       stopProcess(getAbortReason(options.signal));
     };
 
-    const timer = setTimeout(() => {
-      if (settled || processError) return;
-      stopProcess(new Error(`${command} timed out after ${AGENT_TIMEOUT_MS}ms`));
-    }, AGENT_TIMEOUT_MS);
+    const isJobActive = () => {
+      if (typeof options.isJobActive !== "function") return false;
+      try {
+        return Boolean(options.isJobActive());
+      } catch {
+        return false;
+      }
+    };
+
+    const scheduleTimeoutCheck = () => {
+      timeoutTimer = setTimeout(() => {
+        if (settled || processError) return;
+        if (isJobActive()) {
+          scheduleTimeoutCheck();
+          return;
+        }
+        stopProcess(new Error(`${command} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    };
+
+    scheduleTimeoutCheck();
 
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -816,6 +850,7 @@ function runProcess(command, args, stdinText, options = {}) {
     });
 
     child.on("error", (error) => {
+      if (settled || processError) return;
       settle(
         reject,
         new Error(
@@ -1821,8 +1856,12 @@ function tail(value, maxLength = 1200) {
 }
 
 function readPositiveIntegerEnv(name, fallback) {
-  const value = Number(process.env[name]);
-  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+  return readPositiveInteger(process.env[name], fallback);
+}
+
+function readPositiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
 }
 
 function readBooleanEnv(name) {

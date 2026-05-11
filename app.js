@@ -1189,7 +1189,7 @@ async function submitAgentJob(room, agent, sourceText, typingMessageId) {
   } catch (error) {
     if (error.name === "AbortError") {
       throw new Error(
-        `请求超过 ${formatDuration(timeoutMs)}，已停止等待。请检查 Claude/Codex CLI 登录、网络或调大 AGENT_TIMEOUT_MS。`,
+        `提交请求超过 ${formatDuration(timeoutMs)}，已停止等待。请检查后端服务是否可访问。`,
       );
     }
     throw error;

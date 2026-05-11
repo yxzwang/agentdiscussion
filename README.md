@@ -35,7 +35,7 @@ http://localhost:5173
   - Claude Code: `claude --print`
 - agent 返回内容会作为群聊消息回流到讨论组中。
 - agent 运行目录是当前讨论组设置的路径，默认是当前项目目录。
-- 前端会显示 agent 已等待时间；请求超过后端超时时间后会自动停止等待并显示错误。
+- 前端会显示 agent 已等待时间；后端会按配置的间隔检查后台 job 是否仍在运行，运行中则继续等待。
 - 如果浏览器中断请求，后端会取消对应 agent 调用并清理子进程树。
 
 ## 配置
@@ -43,7 +43,7 @@ http://localhost:5173
 可用环境变量：
 
 - `PORT`：Web 服务端口，默认 `5173`
-- `AGENT_TIMEOUT_MS`：单次 agent 调用超时时间，默认 `300000`
+- `AGENT_TIMEOUT_MS`：后台 agent job 存活检查间隔，默认 `300000`。检查时 job 仍在运行则继续等待；job 已丢失才按超时失败处理。
 - `CODEX_COMMAND`：Codex CLI 命令，默认 Windows 为 `codex.cmd`，其他系统为 `codex`
 - `CLAUDE_COMMAND`：Claude Code CLI 命令，默认 Windows 为 `claude.cmd`，其他系统为 `claude`
 - `AGENTDISCUSSION_STATE_FILE`：打开中的讨论组状态文件，默认 `.mca/open-rooms.json`
@@ -76,5 +76,5 @@ Codex 后端调用不再指定 `--sandbox`，使用当前 Codex CLI 的默认沙
 - 运行 `claude --print "你好"` 是否能在终端直接返回。
 - Claude Code 是否已登录，或 `ANTHROPIC_API_KEY` / apiKeyHelper 是否可用。
 - 网络代理是否允许 Claude Code CLI 访问模型服务。
-- 默认单次 agent 超时已调到 5 分钟；如果超时或进程异常退出，后端会清空旧 session 状态并重启该 agent 重试一次。
-- 任务确实需要更久时，可继续调大 `AGENT_TIMEOUT_MS` 后重新 `npm start`。
+- 默认 agent job 存活检查间隔是 5 分钟；长任务只要后台 job 仍在运行就会继续等待，不会因为到达该时间自动重启。
+- 如果进程异常退出或返回空响应，后端仍会清空旧 session 状态并重启该 agent 重试一次。
